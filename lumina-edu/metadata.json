@@ -1,0 +1,5 @@
+{
+  "name": "Lumina Edu",
+  "description": "An AI-powered educational platform using Gemini 3.1 Pro for native PDF understanding, PPT generation, and intelligent student tutoring.",
+  "requestFramePermissions": []
+}
