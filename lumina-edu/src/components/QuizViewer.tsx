@@ -129,24 +129,24 @@ export default function QuizViewer({
 
   if (isFinished && !isTeacherView) {
     return (
-      <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-100 text-center max-w-2xl mx-auto">
+      <div className="bg-white dark:bg-slate-800 p-8 rounded-2xl shadow-sm border border-slate-100 dark:border-slate-700 text-center max-w-2xl mx-auto">
         <div className="mb-6">
-          <div className="w-20 h-20 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center mx-auto mb-4">
+          <div className="w-20 h-20 bg-indigo-100 dark:bg-indigo-900/50 text-indigo-600 dark:text-indigo-400 rounded-full flex items-center justify-center mx-auto mb-4">
             <CheckCircle2 size={40} />
           </div>
-          <h2 className="text-3xl font-bold text-slate-800">Quiz Submitted!</h2>
+          <h2 className="text-3xl font-bold text-slate-800 dark:text-slate-200">Quiz Submitted!</h2>
         </div>
         
-        <div className="bg-slate-50 rounded-2xl p-8 mb-8">
-          <div className="text-6xl font-black text-indigo-600 mb-2">
+        <div className="bg-slate-50 dark:bg-slate-900/50 rounded-2xl p-8 mb-8">
+          <div className="text-6xl font-black text-indigo-600 dark:text-indigo-400 mb-2">
             {Math.round((score / questions.length) * 100)}%
           </div>
-          <p className="text-slate-500 font-medium">
+          <p className="text-slate-500 dark:text-slate-400 font-medium">
             You got {score} out of {questions.length} questions correct
           </p>
         </div>
 
-        <p className="text-slate-600 mb-8 text-lg">
+        <p className="text-slate-600 dark:text-slate-300 mb-8 text-lg">
           {score === questions.length ? 'Perfect score! Excellent understanding.' : 
            score >= questions.length / 2 ? 'Good job! Review the explanations below to master the concepts.' : 
            'Review the material and the explanations below to improve.'}
@@ -172,7 +172,7 @@ export default function QuizViewer({
     <div className="max-w-3xl mx-auto">
       <div className="mb-6 flex items-center justify-between">
         <div className="flex flex-col">
-          <span className="text-sm font-bold text-indigo-600 uppercase tracking-wider mb-1">
+          <span className="text-sm font-bold text-indigo-600 dark:text-indigo-400 uppercase tracking-wider mb-1">
             {isReviewMode ? 'Review Mode' : `Question ${currentIndex + 1} of ${questions.length}`}
           </span>
           <div className="flex gap-1">
@@ -180,8 +180,8 @@ export default function QuizViewer({
               <div 
                 key={idx} 
                 className={`h-1.5 w-6 rounded-full transition-all duration-300 ${
-                  idx === currentIndex ? 'bg-indigo-600 w-10' : 
-                  userAnswers[idx] !== null ? 'bg-indigo-200' : 'bg-slate-200'
+                  idx === currentIndex ? 'bg-indigo-600 dark:bg-indigo-500 w-10' : 
+                  userAnswers[idx] !== null ? 'bg-indigo-200 dark:bg-indigo-900/50' : 'bg-slate-200 dark:bg-slate-700'
                 }`}
               />
             ))}
@@ -190,8 +190,8 @@ export default function QuizViewer({
         {showFeedback && userAnswers[currentIndex] !== null && (
           <div className={`px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider ${
             isCurrentCorrect 
-              ? 'bg-emerald-100 text-emerald-700' 
-              : 'bg-red-100 text-red-700'
+              ? 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-400' 
+              : 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-400'
           }`}>
             {isCurrentCorrect ? 'Correct' : 'Incorrect'}
           </div>
@@ -204,9 +204,9 @@ export default function QuizViewer({
           initial={{ opacity: 0, x: 20 }}
           animate={{ opacity: 1, x: 0 }}
           exit={{ opacity: 0, x: -20 }}
-          className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200/50 border border-slate-100"
+          className="bg-white dark:bg-slate-800 p-8 rounded-3xl shadow-xl shadow-slate-200/50 dark:shadow-none border border-slate-100 dark:border-slate-700"
         >
-          <h3 className="text-2xl font-bold text-slate-800 mb-8 leading-tight">
+          <h3 className="text-2xl font-bold text-slate-800 dark:text-slate-200 mb-8 leading-tight">
             {currentQuestion.question}
           </h3>
 
@@ -215,18 +215,18 @@ export default function QuizViewer({
               const isSelected = userAnswers[currentIndex] === idx;
               const isCorrect = idx === currentQuestion.correctAnswerIndex;
               
-              let optionStyles = "border-slate-100 bg-slate-50 hover:bg-white hover:border-indigo-300 hover:shadow-md text-slate-700";
+              let optionStyles = "border-slate-100 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:bg-white dark:hover:bg-slate-700 hover:border-indigo-300 dark:hover:border-indigo-500 hover:shadow-md text-slate-700 dark:text-slate-300";
               
               if (showFeedback) {
                 if (isCorrect) {
-                  optionStyles = "border-emerald-500 bg-emerald-50 text-emerald-900 shadow-sm";
+                  optionStyles = "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 text-emerald-900 dark:text-emerald-300 shadow-sm";
                 } else if (isSelected) {
-                  optionStyles = "border-red-500 bg-red-50 text-red-900 shadow-sm";
+                  optionStyles = "border-red-500 bg-red-50 dark:bg-red-900/20 text-red-900 dark:text-red-300 shadow-sm";
                 } else {
-                  optionStyles = "border-slate-100 opacity-50 text-slate-400 cursor-default";
+                  optionStyles = "border-slate-100 dark:border-slate-700 opacity-50 text-slate-400 dark:text-slate-500 cursor-default";
                 }
               } else if (isSelected) {
-                optionStyles = "border-indigo-500 bg-indigo-50 text-indigo-900 shadow-sm";
+                optionStyles = "border-indigo-500 bg-indigo-50 dark:bg-indigo-900/20 text-indigo-900 dark:text-indigo-300 shadow-sm";
               }
 
               return (
@@ -241,7 +241,7 @@ export default function QuizViewer({
                       isCorrect && showFeedback ? 'bg-emerald-500 text-white' :
                       isSelected && !isCorrect && showFeedback ? 'bg-red-500 text-white' :
                       isSelected && !showFeedback ? 'bg-indigo-500 text-white' :
-                      'bg-white text-slate-400 group-hover:text-indigo-600'
+                      'bg-white dark:bg-slate-700 text-slate-400 dark:text-slate-500 group-hover:text-indigo-600 dark:group-hover:text-indigo-400'
                     }`}>
                       {String.fromCharCode(65 + idx)}
                     </div>
@@ -258,15 +258,15 @@ export default function QuizViewer({
             <motion.div 
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              className="mt-8 p-6 bg-indigo-50/50 rounded-2xl border border-indigo-100"
+              className="mt-8 p-6 bg-indigo-50/50 dark:bg-indigo-900/20 rounded-2xl border border-indigo-100 dark:border-indigo-800"
             >
               <div className="flex items-start gap-4">
-                <div className="bg-indigo-100 p-2 rounded-xl">
-                  <HelpCircle className="text-indigo-600 w-5 h-5" />
+                <div className="bg-indigo-100 dark:bg-indigo-900/50 p-2 rounded-xl">
+                  <HelpCircle className="text-indigo-600 dark:text-indigo-400 w-5 h-5" />
                 </div>
                 <div>
-                  <h4 className="font-bold text-indigo-900 mb-1">Explanation</h4>
-                  <p className="text-indigo-800/80 leading-relaxed text-sm">{currentQuestion.explanation}</p>
+                  <h4 className="font-bold text-indigo-900 dark:text-indigo-300 mb-1">Explanation</h4>
+                  <p className="text-indigo-800/80 dark:text-indigo-200/80 leading-relaxed text-sm">{currentQuestion.explanation}</p>
                 </div>
               </div>
             </motion.div>
@@ -276,7 +276,7 @@ export default function QuizViewer({
             <button
               onClick={prevQuestion}
               disabled={currentIndex === 0}
-              className="flex items-center gap-2 text-slate-500 font-bold hover:text-slate-700 disabled:opacity-0 transition-all"
+              className="flex items-center gap-2 text-slate-500 dark:text-slate-400 font-bold hover:text-slate-700 dark:hover:text-slate-300 disabled:opacity-0 transition-all"
             >
               <ArrowRight size={20} className="rotate-180" />
               Previous

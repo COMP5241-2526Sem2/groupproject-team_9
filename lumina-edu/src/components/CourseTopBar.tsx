@@ -1,21 +1,34 @@
-import React, { useState, useEffect } from 'react';
-import { Bell, MessageSquare, ArrowLeft, Sparkles, LogOut, Presentation, GraduationCap, ChevronDown } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Bell, MessageSquare, ArrowLeft, Sparkles, LogOut, Presentation, GraduationCap, ChevronDown, Search, X, Plus, Moon, Sun } from 'lucide-react';
 import { Course } from './CourseList';
 import AnnouncementModal from './AnnouncementModal';
 import GroupChat from './GroupChat';
 import { supabase } from '../lib/supabase';
+import { motion, AnimatePresence } from 'motion/react';
 
 interface CourseTopBarProps {
   user: { id: string; role: 'teacher' | 'student'; name: string };
   activeCourse: Course | null;
   onBack: () => void;
   onLogout: () => void;
+  searchQuery: string;
+  onSearchChange: (query: string) => void;
+  isDarkMode: boolean;
+  onToggleDarkMode: () => void;
 }
 
-export default function CourseTopBar({ user, activeCourse, onBack, onLogout }: CourseTopBarProps) {
+export default function CourseTopBar({ user, activeCourse, onBack, onLogout, searchQuery, onSearchChange, isDarkMode, onToggleDarkMode }: CourseTopBarProps) {
   const [isAnnouncementOpen, setIsAnnouncementOpen] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [hasUnreadAnnouncements, setHasUnreadAnnouncements] = useState(false);
+  const [isSearchExpanded, setIsSearchExpanded] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (isSearchExpanded) {
+      searchInputRef.current?.focus();
+    }
+  }, [isSearchExpanded]);
 
   useEffect(() => {
     if (activeCourse) {
@@ -88,14 +101,14 @@ export default function CourseTopBar({ user, activeCourse, onBack, onLogout }: C
 
   return (
     <>
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-40">
+      <header className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 sticky top-0 z-40 transition-colors">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
             <div className="flex items-center gap-4">
               {activeCourse && (
                 <button 
                   onClick={onBack}
-                  className="p-2 -ml-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-colors"
+                  className="p-2 -ml-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors"
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
@@ -109,19 +122,70 @@ export default function CourseTopBar({ user, activeCourse, onBack, onLogout }: C
                 </span>
               </div>
               {activeCourse && (
-                <div className="hidden md:flex items-center gap-2 ml-4 pl-4 border-l border-slate-200">
-                  <span className="text-sm font-medium text-slate-600">{activeCourse.name}</span>
-                  <span className="text-xs px-2 py-1 bg-slate-100 rounded-md text-slate-500 font-mono">{activeCourse.code}</span>
+                <div className="hidden md:flex items-center gap-2 ml-4 pl-4 border-l border-slate-200 dark:border-slate-700">
+                  <span className="text-sm font-medium text-slate-600 dark:text-white">{activeCourse.name}</span>
+                  <span className="text-xs px-2 py-1 bg-slate-100 dark:bg-slate-800 rounded-md text-slate-500 dark:text-slate-400 font-mono">{activeCourse.code}</span>
                 </div>
               )}
             </div>
             
             <div className="flex items-center gap-2 sm:gap-4">
+              {/* Search Module (Only on Course List) */}
+              {!activeCourse && (
+                <div className="flex items-center">
+                  <AnimatePresence mode="wait">
+                    {isSearchExpanded ? (
+                      <motion.div
+                        initial={{ width: 0, opacity: 0 }}
+                        animate={{ width: 'auto', opacity: 1 }}
+                        exit={{ width: 0, opacity: 0 }}
+                        className="flex items-center bg-slate-100 dark:bg-slate-800 rounded-xl overflow-hidden"
+                      >
+                        <div className="pl-3">
+                          <Search className="w-4 h-4 text-slate-400" />
+                        </div>
+                        <input
+                          ref={searchInputRef}
+                          type="text"
+                          placeholder="Search courses..."
+                          value={searchQuery}
+                          onChange={(e) => onSearchChange(e.target.value)}
+                          onBlur={() => {
+                            if (!searchQuery) setIsSearchExpanded(false);
+                          }}
+                          className="px-3 py-2 bg-transparent border-none outline-none text-sm w-40 sm:w-64 text-slate-700 dark:text-slate-200 placeholder:text-slate-400"
+                        />
+                        <button
+                          onClick={() => {
+                            onSearchChange('');
+                            setIsSearchExpanded(false);
+                          }}
+                          className="pr-3 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </motion.div>
+                    ) : (
+                      <motion.button
+                        initial={{ scale: 0.8, opacity: 0 }}
+                        animate={{ scale: 1, opacity: 1 }}
+                        exit={{ scale: 0.8, opacity: 0 }}
+                        onClick={() => setIsSearchExpanded(true)}
+                        className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 dark:hover:text-indigo-400 rounded-xl transition-all"
+                        title="Search Courses"
+                      >
+                        <Search className="w-5 h-5" />
+                      </motion.button>
+                    )}
+                  </AnimatePresence>
+                </div>
+              )}
+
               {activeCourse && (
-                <div className="flex items-center gap-1 sm:gap-2 mr-2 pr-2 sm:mr-4 sm:pr-4 border-r border-slate-200">
+                <div className="flex items-center gap-1 sm:gap-2 mr-2 pr-2 sm:mr-4 sm:pr-4 border-r border-slate-200 dark:border-slate-700">
                   <button
                     onClick={handleOpenAnnouncements}
-                    className="relative p-2 text-slate-500 hover:text-amber-600 hover:bg-amber-50 rounded-xl transition-all"
+                    className="relative p-2 text-slate-500 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-900/30 dark:hover:text-amber-400 rounded-xl transition-all"
                     title="Announcements"
                   >
                     <Bell className="w-5 h-5" />
@@ -133,8 +197,8 @@ export default function CourseTopBar({ user, activeCourse, onBack, onLogout }: C
                     onClick={() => setIsChatOpen(!isChatOpen)}
                     className={`p-2 rounded-xl transition-all ${
                       isChatOpen 
-                        ? 'bg-indigo-100 text-indigo-600' 
-                        : 'text-slate-500 hover:text-indigo-600 hover:bg-indigo-50'
+                        ? 'bg-indigo-100 dark:bg-indigo-900/50 text-indigo-600 dark:text-indigo-400' 
+                        : 'text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 dark:hover:text-indigo-400'
                     }`}
                     title="Group Chat"
                   >
@@ -143,18 +207,26 @@ export default function CourseTopBar({ user, activeCourse, onBack, onLogout }: C
                 </div>
               )}
 
-              <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-slate-100 rounded-full">
+              <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-full">
                 {user.role === 'teacher' ? (
-                  <Presentation className="w-4 h-4 text-emerald-600" />
+                  <Presentation className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
                 ) : (
-                  <GraduationCap className="w-4 h-4 text-indigo-600" />
+                  <GraduationCap className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
                 )}
-                <span className="text-sm font-medium text-slate-700">{user.name}</span>
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-200">{user.name}</span>
               </div>
               
               <button
+                onClick={onToggleDarkMode}
+                className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-slate-800 dark:hover:text-indigo-400 rounded-full transition-colors"
+                title="Toggle Dark Mode"
+              >
+                {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+              </button>
+
+              <button
                 onClick={onLogout}
-                className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-full transition-colors"
+                className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 dark:hover:text-red-400 rounded-full transition-colors"
                 title="Log out"
               >
                 <LogOut className="w-5 h-5" />

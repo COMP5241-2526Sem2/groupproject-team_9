@@ -110,7 +110,7 @@ export default function GroupChat({ courseId, userId, userName, userRole, isOpen
   if (!isOpen) return null;
 
   return (
-    <div className={`fixed bottom-4 right-4 z-50 flex flex-col bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden transition-all duration-300 ease-in-out ${
+    <div className={`fixed bottom-4 right-4 z-50 flex flex-col bg-white dark:bg-slate-800 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-700 overflow-hidden transition-all duration-300 ease-in-out ${
       isExpanded ? 'w-[400px] h-[600px]' : 'w-[350px] h-[500px]'
     }`}>
       {/* Header */}
@@ -143,7 +143,7 @@ export default function GroupChat({ courseId, userId, userName, userRole, isOpen
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50">
+      <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50 dark:bg-slate-900/50">
         {isLoading ? (
           <div className="flex flex-col items-center justify-center h-full text-slate-400">
             <Loader2 className="w-6 h-6 animate-spin mb-2" />
@@ -184,7 +184,7 @@ export default function GroupChat({ courseId, userId, userName, userRole, isOpen
               <div className={`max-w-[85%] px-4 py-2 rounded-2xl text-sm shadow-sm ${
                 msg.user_id === userId 
                   ? 'bg-indigo-600 text-white rounded-tr-none' 
-                  : 'bg-white text-slate-700 border border-slate-200 rounded-tl-none'
+                  : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-tl-none'
               }`}>
                 {msg.content}
               </div>
@@ -198,14 +198,14 @@ export default function GroupChat({ courseId, userId, userName, userRole, isOpen
       </div>
 
       {/* Input */}
-      <form onSubmit={handleSendMessage} className="p-4 border-t border-slate-100 bg-white">
+      <form onSubmit={handleSendMessage} className="p-4 border-t border-slate-100 dark:border-slate-700 bg-white dark:bg-slate-800">
         <div className="flex gap-2">
           <input
             type="text"
             value={newMessage}
             onChange={(e) => setNewMessage(e.target.value)}
             placeholder="Type a message..."
-            className="flex-1 px-4 py-2 bg-slate-100 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+            className="flex-1 px-4 py-2 bg-slate-100 dark:bg-slate-700 border-none rounded-xl text-sm text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
           />
           <button
             type="submit"
