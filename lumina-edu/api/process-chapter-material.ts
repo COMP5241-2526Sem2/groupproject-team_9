@@ -40,46 +40,7 @@ type ProcessPayload = {
   mimeType?: string;
 };
 
-type GeminiCallOptions = {
-  model?: string;
-  temperature?: number;
-  responseMimeType?: string;
-  responseJsonSchema?: Record<string, any>;
-};
-
-const QUIZ_JSON_SCHEMA: Record<string, any> = {
-  type: 'array',
-  minItems: 10,
-  maxItems: 10,
-  items: {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      question: {
-        type: 'string',
-        description: 'A multiple-choice question based only on the chapter material.',
-      },
-      options: {
-        type: 'array',
-        minItems: 4,
-        maxItems: 4,
-        items: { type: 'string' },
-        description: 'Exactly 4 plausible answer options.',
-      },
-      correctAnswerIndex: {
-        type: 'integer',
-        minimum: 0,
-        maximum: 3,
-        description: 'Index of the correct option, from 0 to 3.',
-      },
-      explanation: {
-        type: 'string',
-        description: 'Brief explanation of why the answer is correct.',
-      },
-    },
-    required: ['question', 'options', 'correctAnswerIndex', 'explanation'],
-  },
-};
+type QwenDocParsingStrategy = 'auto' | 'text_only' | 'text_and_images';
 
 function getSupabaseAdmin(): SupabaseClient {
   const supabaseUrl =
@@ -97,20 +58,47 @@ function getSupabaseAdmin(): SupabaseClient {
   });
 }
 
-function getGeminiConfig() {
-  const apiKey = process.env.GEMINI_API_KEY || '';
+function getQwenDocConfig() {
+  const apiKey =
+    process.env.QWEN_API_KEY ||
+    process.env.DASHSCOPE_API_KEY ||
+    process.env.LLM_API_KEY ||
+    '';
 
   if (!apiKey) {
-    throw new Error('Missing GEMINI_API_KEY.');
+    throw new Error(
+      'Missing QWEN_API_KEY (or DASHSCOPE_API_KEY / LLM_API_KEY).'
+    );
+  }
+
+  return {
+    apiKey,
+    endpoint:
+      process.env.QWEN_DASHSCOPE_BASE_URL ||
+      'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
+    model: process.env.QWEN_DOC_MODEL || 'qwen-doc-turbo',
+  };
+}
+
+function getQwenChatConfig() {
+  const apiKey =
+    process.env.QWEN_API_KEY ||
+    process.env.DASHSCOPE_API_KEY ||
+    process.env.LLM_API_KEY ||
+    '';
+
+  if (!apiKey) {
+    throw new Error(
+      'Missing QWEN_API_KEY (or DASHSCOPE_API_KEY / LLM_API_KEY).'
+    );
   }
 
   return {
     apiKey,
     baseUrl:
-      process.env.GEMINI_BASE_URL?.replace(/\/$/, '') ||
-      'https://generativelanguage.googleapis.com/v1beta',
-    docModel: process.env.GEMINI_DOC_MODEL || 'gemini-2.5-flash',
-    textModel: process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash',
+      process.env.QWEN_BASE_URL?.replace(/\/$/, '') ||
+      'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+    model: process.env.LLM_MODEL || 'qwen-plus',
   };
 }
 
@@ -260,7 +248,7 @@ async function processChapterMaterial(
     processing_error: null,
   });
 
-  const extractedText = await extractTextFromFileWithGemini({
+  const extractedText = await extractTextFromFileWithQwen({
     fileUrl,
     fileName,
     mimeType,
@@ -270,7 +258,7 @@ async function processChapterMaterial(
 
   if (!normalizedText || normalizedText.length < 80) {
     throw new Error(
-      'Gemini document parsing returned too little content. Please try another file or verify that the uploaded document is readable.'
+      'Qwen document parsing returned too little content. Please try another file or verify that the uploaded document is readable.'
     );
   }
 
@@ -398,7 +386,7 @@ async function failChapter(
   }
 }
 
-async function extractTextFromFileWithGemini(args: {
+async function extractTextFromFileWithQwen(args: {
   fileUrl: string;
   fileName: string;
   mimeType?: string;
@@ -415,23 +403,44 @@ async function extractTextFromFileWithGemini(args: {
     mimeType: resolvedMimeType,
   });
 
-  console.log('[gemini-doc] request', {
+  console.log('[qwen-doc] request', {
     fileName,
     mimeType: resolvedMimeType,
     fileUrl,
   });
 
-  const text = await callGeminiDocumentUrl({
-    fileUrl,
-    mimeType: resolvedMimeType,
-    prompt,
-  });
+  let lastError: unknown = null;
 
-  const normalized = normalizeExtractedText(text);
+  const strategies: QwenDocParsingStrategy[] = ['auto', 'text_and_images', 'text_only'];
 
-  console.log('[gemini-doc] extracted length:', normalized.length);
+  for (const strategy of strategies) {
+    try {
+      const text = await callQwenDocumentUrl({
+        fileUrl,
+        mimeType: resolvedMimeType,
+        prompt,
+        parsingStrategy: strategy,
+      });
 
-  return normalized;
+      const normalized = normalizeExtractedText(text);
+      console.log('[qwen-doc] extracted length:', normalized.length, 'strategy=', strategy);
+
+      if (normalized.length >= 80) {
+        return normalized;
+      }
+
+      lastError = new Error(
+        `Qwen document parsing returned too little content with strategy "${strategy}".`
+      );
+    } catch (err) {
+      lastError = err;
+      console.error('[qwen-doc] strategy failed:', strategy, err);
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Qwen document parsing failed.');
 }
 
 function buildDocExtractionPrompt(args: {
@@ -464,49 +473,91 @@ MIME type: ${mimeType || 'unknown'}
 `.trim();
 }
 
-async function callGeminiDocumentUrl(args: {
+async function callQwenDocumentUrl(args: {
   fileUrl: string;
   mimeType: string;
   prompt: string;
+  parsingStrategy: QwenDocParsingStrategy;
 }): Promise<string> {
-  const { fileUrl, mimeType, prompt } = args;
+  const { fileUrl, mimeType, prompt, parsingStrategy } = args;
+  const { apiKey, endpoint, model } = getQwenDocConfig();
 
-  const data = await callGeminiGenerateContent(
-    [
-      {
-        file_data: {
-          mime_type: mimeType,
-          file_uri: fileUrl,
+  const body = {
+    model,
+    input: {
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a careful document parsing assistant.',
         },
-      },
-      {
-        text: prompt,
-      },
-    ],
-    {
-      model: getGeminiConfig().docModel,
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: prompt,
+            },
+            {
+              type: 'doc_url',
+              doc_url: [fileUrl],
+              file_parsing_strategy: parsingStrategy,
+              mime_type: mimeType,
+            },
+          ],
+        },
+      ],
+    },
+    parameters: {
+      result_format: 'message',
       temperature: 0.1,
+    },
+  };
+
+  const res = await fetchWithTimeout(
+    endpoint,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
     },
     120000
   );
 
-  const text = extractGeminiText(data);
+  const raw = await res.text();
 
-  if (!text) {
-    const urlStatus =
-      data?.candidates?.[0]?.urlRetrievalStatus ||
-      data?.candidates?.[0]?.url_retrieval_status ||
-      data?.urlRetrievalStatus ||
-      data?.url_retrieval_status;
+  if (!res.ok) {
+    throw new Error(`Qwen document request failed: ${res.status} ${truncate(raw)}`);
+  }
 
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Qwen document returned non-JSON response: ${truncate(raw)}`);
+  }
+
+  const statusCode = Number(data?.status_code ?? 200);
+  const errorCode = data?.code;
+  const errorMessage = data?.message;
+
+  if (statusCode !== 200) {
     throw new Error(
-      `Gemini document parsing returned empty content. urlStatus=${String(
-        urlStatus || ''
-      )} raw=${truncate(JSON.stringify(data))}`
+      `Qwen document parse failed: status_code=${statusCode}, code=${String(
+        errorCode || ''
+      )}, message=${String(errorMessage || '')}`
     );
   }
 
-  return text;
+  const content = extractQwenText(data);
+
+  if (!content) {
+    throw new Error(`Qwen document parsing returned empty content. raw=${truncate(raw)}`);
+  }
+
+  return content;
 }
 
 async function generateRelevantReading(args: {
@@ -540,26 +591,7 @@ Chapter material:
 ${context}
 `.trim();
 
-  const data = await callGeminiGenerateContent(
-    [{ text: prompt }],
-    {
-      model: getGeminiConfig().textModel,
-      temperature: 0.4,
-    },
-    120000
-  );
-
-  const text = extractGeminiText(data);
-
-  if (!text) {
-    throw new Error(
-      `Gemini reading generation returned empty content. raw=${truncate(
-        JSON.stringify(data)
-      )}`
-    );
-  }
-
-  return text.trim();
+  return await callQwenChatText(prompt, 0.4);
 }
 
 async function generateQuiz(args: {
@@ -574,50 +606,30 @@ You are generating a chapter quiz for students.
 Task:
 Create exactly 10 multiple-choice questions based only on the chapter material.
 
+Output requirements:
+- Return ONLY valid JSON.
+- Return an array of 10 objects.
+- Each object must have:
+  - "question": string
+  - "options": string[]   // exactly 4 options
+  - "correctAnswerIndex": number   // 0 to 3
+  - "explanation": string
+
 Quality requirements:
 - Questions should test understanding, not trivial wording.
 - Distractors should be plausible.
 - Keep explanations concise.
 - Do not invent facts that are not supported by the chapter material.
-`.trim();
-
-  const data = await callGeminiGenerateContent(
-    [
-      {
-        text: `${prompt}
 
 Chapter title:
 ${chapterTitle}
 
 Chapter material:
-${context}`,
-      },
-    ],
-    {
-      model: getGeminiConfig().textModel,
-      temperature: 0.2,
-      responseMimeType: 'application/json',
-      responseJsonSchema: QUIZ_JSON_SCHEMA,
-    },
-    120000
-  );
+${context}
+`.trim();
 
-  const raw = extractGeminiText(data);
-
-  if (!raw) {
-    throw new Error(
-      `Gemini quiz generation returned empty content. raw=${truncate(
-        JSON.stringify(data)
-      )}`
-    );
-  }
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`Could not parse quiz JSON from Gemini output: ${truncate(raw)}`);
-  }
+  const raw = await callQwenChatText(prompt, 0.2);
+  const parsed = parseQuizJson(raw);
 
   if (!Array.isArray(parsed) || parsed.length !== 10) {
     throw new Error('Quiz JSON parsing failed or returned wrong number of questions.');
@@ -644,36 +656,36 @@ ${context}`,
   return sanitized;
 }
 
-async function callGeminiGenerateContent(
-  parts: Array<Record<string, any>>,
-  options: GeminiCallOptions = {},
-  timeoutMs = 120000
-): Promise<any> {
-  const { apiKey, baseUrl, textModel } = getGeminiConfig();
-  const model = options.model || textModel;
+function parseQuizJson(raw: string): any[] {
+  const cleaned = raw
+    .trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
 
-  const endpoint = `${baseUrl}/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed?.quiz)) return parsed.quiz;
+  } catch {}
 
-  const body: Record<string, any> = {
-    contents: [
-      {
-        parts,
-      },
-    ],
-    generationConfig: {
-      temperature: options.temperature ?? 0.3,
-    },
-  };
+  const firstBracket = cleaned.indexOf('[');
+  const lastBracket = cleaned.lastIndexOf(']');
 
-  if (options.responseMimeType) {
-    body.generationConfig.responseMimeType = options.responseMimeType;
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    const sliced = cleaned.slice(firstBracket, lastBracket + 1);
+    try {
+      return JSON.parse(sliced);
+    } catch {}
   }
 
-  if (options.responseJsonSchema) {
-    body.generationConfig.responseJsonSchema = options.responseJsonSchema;
-  }
+  throw new Error(`Could not parse quiz JSON from model output: ${truncate(raw)}`);
+}
+
+async function callQwenChatText(prompt: string, temperature = 0.3): Promise<string> {
+  const { apiKey, baseUrl, model } = getQwenChatConfig();
+  const endpoint = `${baseUrl}/chat/completions`;
 
   const res = await fetchWithTimeout(
     endpoint,
@@ -681,47 +693,60 @@ async function callGeminiGenerateContent(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        model,
+        temperature,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a precise educational assistant. Follow the output format exactly.',
+          },
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+      }),
     },
-    timeoutMs
+    120000
   );
 
   const raw = await res.text();
 
   if (!res.ok) {
-    throw new Error(`Gemini request failed: ${res.status} ${truncate(raw)}`);
+    throw new Error(`Qwen chat request failed: ${res.status} ${truncate(raw)}`);
   }
 
   let data: any;
   try {
     data = JSON.parse(raw);
   } catch {
-    throw new Error(`Gemini returned non-JSON response: ${truncate(raw)}`);
+    throw new Error(`Qwen chat returned non-JSON response: ${truncate(raw)}`);
   }
 
-  const blockedReason =
-    data?.promptFeedback?.blockReason || data?.prompt_feedback?.block_reason;
+  const content = extractQwenText(data);
 
-  if (blockedReason) {
-    throw new Error(`Gemini blocked the request: ${String(blockedReason)}`);
+  if (!content) {
+    throw new Error(`Qwen chat returned empty content. raw=${truncate(raw)}`);
   }
 
-  const candidate = data?.candidates?.[0];
-  if (!candidate) {
-    throw new Error(`Gemini returned no candidates: ${truncate(raw)}`);
-  }
-
-  return data;
+  return content;
 }
 
-function extractGeminiText(data: any): string {
-  const candidate = data?.candidates?.[0];
-  const parts = candidate?.content?.parts;
+function extractQwenText(data: any): string {
+  const content = data?.output?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.message?.content;
 
-  if (Array.isArray(parts)) {
-    const text = parts
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    const text = content
       .map((part: any) => {
+        if (typeof part === 'string') return part;
         if (typeof part?.text === 'string') return part.text;
         return '';
       })
@@ -731,8 +756,8 @@ function extractGeminiText(data: any): string {
     if (text) return text;
   }
 
-  if (typeof data?.text === 'string') {
-    return data.text.trim();
+  if (typeof data?.output?.text === 'string') {
+    return data.output.text.trim();
   }
 
   return '';

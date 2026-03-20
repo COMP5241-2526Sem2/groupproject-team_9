@@ -32,19 +32,23 @@ function json(data: unknown, status = 200) {
   });
 }
 
-function getGeminiConfig() {
-  const apiKey = process.env.GEMINI_API_KEY || '';
+function getQwenConfig() {
+  const apiKey =
+    process.env.QWEN_API_KEY ||
+    process.env.DASHSCOPE_API_KEY ||
+    process.env.LLM_API_KEY ||
+    '';
 
   if (!apiKey) {
-    throw new Error('Missing GEMINI_API_KEY');
+    throw new Error('Missing QWEN_API_KEY (or DASHSCOPE_API_KEY / LLM_API_KEY)');
   }
 
   return {
     apiKey,
     baseUrl:
-      process.env.GEMINI_BASE_URL?.replace(/\/$/, '') ||
-      'https://generativelanguage.googleapis.com/v1beta',
-    model: process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash',
+      process.env.QWEN_BASE_URL?.replace(/\/$/, '') ||
+      'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+    model: process.env.LLM_MODEL || 'qwen-plus',
   };
 }
 
@@ -161,31 +165,38 @@ function retrieveRelevantContext(text: string, reading: string, question: string
   return top.join('\n\n---\n\n').slice(0, 8000);
 }
 
-function extractGeminiText(data: any): string {
-  const parts = data?.candidates?.[0]?.content?.parts;
+function extractQwenText(data: any): string {
+  const content =
+    data?.choices?.[0]?.message?.content ??
+    data?.output?.choices?.[0]?.message?.content;
 
-  if (Array.isArray(parts)) {
-    const text = parts
-      .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part: any) => {
+        if (typeof part === 'string') return part;
+        if (typeof part?.text === 'string') return part.text;
+        return '';
+      })
       .join('\n')
       .trim();
 
     if (text) return text;
   }
 
-  if (typeof data?.text === 'string') {
-    return data.text.trim();
+  if (typeof data?.output?.text === 'string') {
+    return data.output.text.trim();
   }
 
   return '';
 }
 
-async function callGeminiText(prompt: string) {
-  const { apiKey, baseUrl, model } = getGeminiConfig();
-
-  const endpoint = `${baseUrl}/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+async function callQwenText(prompt: string) {
+  const { apiKey, baseUrl, model } = getQwenConfig();
+  const endpoint = `${baseUrl}/chat/completions`;
 
   const response = await fetchWithTimeout(
     endpoint,
@@ -193,28 +204,22 @@ async function callGeminiText(prompt: string) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        contents: [
+        model,
+        temperature: 0.3,
+        messages: [
           {
-            parts: [
-              {
-                text: prompt,
-              },
-            ],
+            role: 'system',
+            content:
+              'You are a helpful academic tutor. Answer clearly, accurately, and concisely. Use only the provided chapter context as the main basis. If the context is insufficient, say so clearly before adding cautious supplemental knowledge.',
+          },
+          {
+            role: 'user',
+            content: prompt,
           },
         ],
-        generationConfig: {
-          temperature: 0.3,
-        },
-        systemInstruction: {
-          parts: [
-            {
-              text:
-                'You are a helpful academic tutor. Answer clearly, accurately, and concisely. Use only the provided chapter context as the main basis. If the context is insufficient, say so clearly before adding cautious supplemental knowledge.',
-            },
-          ],
-        },
       }),
     },
     120000
@@ -223,28 +228,21 @@ async function callGeminiText(prompt: string) {
   const raw = await response.text();
 
   if (!response.ok) {
-    throw new Error(`Gemini request failed: ${response.status} ${truncate(raw)}`);
+    throw new Error(`Qwen request failed: ${response.status} ${truncate(raw)}`);
   }
 
   let data: any;
   try {
     data = JSON.parse(raw);
   } catch {
-    throw new Error(`Gemini returned invalid JSON: ${truncate(raw)}`);
+    throw new Error(`Qwen returned invalid JSON: ${truncate(raw)}`);
   }
 
-  const blockedReason =
-    data?.promptFeedback?.blockReason || data?.prompt_feedback?.block_reason;
-
-  if (blockedReason) {
-    throw new Error(`Gemini blocked the request: ${String(blockedReason)}`);
-  }
-
-  const content = extractGeminiText(data);
+  const content = extractQwenText(data);
 
   if (content) return content;
 
-  throw new Error(`Gemini returned empty content: ${truncate(raw)}`);
+  throw new Error(`Qwen returned empty content: ${truncate(raw)}`);
 }
 
 export default async function handler(req: Request) {
@@ -327,18 +325,18 @@ Requirements:
 6. Do not mention API details, internal system details, or model names.
 `.trim();
 
-    const answer = await callGeminiText(prompt);
+    const answer = await callQwenText(prompt);
 
     return json({
       ok: true,
       answer,
     });
   } catch (e: any) {
-    console.error('gemini-chat-doc error:', e);
+    console.error('qwen-chat-doc error:', e);
     return json(
       {
         ok: false,
-        error: e?.message || 'Unknown gemini-chat-doc error',
+        error: e?.message || 'Unknown qwen-chat-doc error',
       },
       500
     );
