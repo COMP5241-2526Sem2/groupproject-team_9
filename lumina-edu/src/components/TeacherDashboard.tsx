@@ -1,14 +1,42 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { UploadCloud, FileText, Loader2, CheckCircle2, HelpCircle, Plus, BookOpen, ChevronRight, Bell, Trash2, PanelLeftClose, PanelLeftOpen, BarChart3, RotateCcw, AlertCircle, Sparkles, Edit2, Check, X, Eye, EyeOff } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  UploadCloud,
+  FileText,
+  Loader2,
+  CheckCircle2,
+  HelpCircle,
+  Plus,
+  BookOpen,
+  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  BarChart3,
+  RotateCcw,
+  AlertCircle,
+  Sparkles,
+  Edit2,
+  Check,
+  X,
+  Eye,
+  EyeOff,
+  Clock3,
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import QuizViewer from './QuizViewer';
 import { supabase } from '../lib/supabase';
 import { Course } from './CourseList';
-import { GoogleGenAI, Type } from '@google/genai';
 import Markdown from 'react-markdown';
 
-// Initialize Gemini
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+type ChapterStatus = 'idle' | 'queued' | 'processing' | 'ready' | 'failed';
+
+interface ChapterPptMeta {
+  supabaseUrl?: string;
+  originalName?: string;
+  storagePath?: string;
+  relevant_reading?: string | null;
+  is_reading_published?: boolean;
+  last_processed_at?: string | null;
+}
 
 export interface Chapter {
   id: string;
@@ -16,8 +44,18 @@ export interface Chapter {
   title: string;
   file_uri: string | null;
   mime_type: string | null;
-  ppt: any;
+  ppt: ChapterPptMeta | null;
   quiz: any[];
+  extracted_text?: string | null;
+
+  // 新增/推荐字段
+  content_status?: string | null;
+  processing_stage?: string | null;
+  processing_progress?: number | null;
+  processing_error?: string | null;
+
+  // 兼容你旧字段
+  extract_status?: string | null;
 }
 
 export interface Announcement {
@@ -33,50 +71,147 @@ interface TeacherDashboardProps {
   user: { id: string; role: 'teacher' | 'student'; name: string };
 }
 
-export default function TeacherDashboard({ course, user }: TeacherDashboardProps) {
+const PROCESSING_STAGE_LABELS: Record<string, string> = {
+  queued: 'Queued',
+  extracting_text: 'Extracting text',
+  parsing_document: 'Parsing document',
+  chunking: 'Chunking content',
+  generating_reading: 'Generating relevant reading',
+  generating_quiz: 'Generating quiz',
+  finalizing: 'Finalizing',
+  completed: 'Completed',
+  failed: 'Failed',
+};
+
+function normalizeStatus(chapter?: Chapter | null): ChapterStatus {
+  if (!chapter) return 'idle';
+
+  const raw = String(chapter.content_status || chapter.extract_status || 'idle').toLowerCase();
+
+  if (raw === 'ready' || raw === 'completed') return 'ready';
+  if (raw === 'failed' || raw === 'error') return 'failed';
+  if (raw === 'queued') return 'queued';
+
+  if (
+    [
+      'processing',
+      'extracting',
+      'extracting_text',
+      'parsing_document',
+      'chunking',
+      'generating_reading',
+      'generating_quiz',
+      'finalizing',
+    ].includes(raw)
+  ) {
+    return 'processing';
+  }
+
+  return 'idle';
+}
+
+function getStageLabel(chapter?: Chapter | null) {
+  if (!chapter) return 'Idle';
+
+  const stage = String(
+    chapter.processing_stage ||
+      chapter.content_status ||
+      chapter.extract_status ||
+      'idle'
+  ).toLowerCase();
+
+  return PROCESSING_STAGE_LABELS[stage] || stage.replace(/_/g, ' ') || 'Idle';
+}
+
+function getProgress(chapter?: Chapter | null) {
+  if (!chapter) return 0;
+
+  const raw = Number(chapter.processing_progress ?? 0);
+  if (!Number.isNaN(raw) && raw >= 0) return Math.min(100, Math.max(0, raw));
+
+  const status = normalizeStatus(chapter);
+  if (status === 'ready') return 100;
+  if (status === 'queued') return 5;
+  return 0;
+}
+
+function renderDocument(chapter: Chapter) {
+  if (!chapter?.ppt?.supabaseUrl) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-slate-500 dark:text-slate-400">
+        <FileText className="w-12 h-12 mb-4 opacity-20" />
+        <p>Material not available yet.</p>
+      </div>
+    );
+  }
+
+  const isPdf =
+    chapter.mime_type === 'application/pdf' ||
+    chapter.ppt?.originalName?.toLowerCase().endsWith('.pdf');
+
+  if (isPdf) {
+    const googleDocsUrl = `https://docs.google.com/viewer?url=${encodeURIComponent(
+      chapter.ppt.supabaseUrl
+    )}&embedded=true`;
+
+    return (
+      <iframe
+        src={googleDocsUrl}
+        className="w-full h-full rounded-b-2xl border-none"
+        title="PDF Viewer"
+      />
+    );
+  }
+
+  const officeUrl = `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(
+    chapter.ppt.supabaseUrl
+  )}`;
+
+  return (
+    <iframe
+      src={officeUrl}
+      className="w-full h-full rounded-b-2xl border-none"
+      title="Document Viewer"
+    />
+  );
+}
+
+export default function TeacherDashboard({ course }: TeacherDashboardProps) {
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [activeChapterId, setActiveChapterId] = useState<string | null>(null);
+
   const [isCreatingChapter, setIsCreatingChapter] = useState(false);
   const [newChapterTitle, setNewChapterTitle] = useState('');
-  
+
   const [isUploading, setIsUploading] = useState(false);
-  const [isGeneratingQuiz, setIsGeneratingQuiz] = useState(false);
-  const [showRegenConfirm, setShowRegenConfirm] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
 
-  // Editing states
   const [isEditingChapterTitle, setIsEditingChapterTitle] = useState(false);
   const [editedChapterTitle, setEditedChapterTitle] = useState('');
+
+  const [activeTab, setActiveTab] = useState<'material' | 'reading' | 'quiz' | 'analytics'>('material');
+
+  const [submissions, setSubmissions] = useState<any[]>([]);
+  const [isLoadingSubmissions, setIsLoadingSubmissions] = useState(false);
+
+  const [editingReading, setEditingReading] = useState('');
+  const [isEditingReading, setIsEditingReading] = useState(false);
+
+  const activeChapter = useMemo(
+    () => chapters.find((c) => c.id === activeChapterId) || null,
+    [chapters, activeChapterId]
+  );
+
+  const activeChapterStatus = normalizeStatus(activeChapter);
+  const activeChapterProgress = getProgress(activeChapter);
+  const activeChapterStageLabel = getStageLabel(activeChapter);
 
   useEffect(() => {
     fetchChapters();
   }, [course.id]);
-
-  const fetchChapters = async () => {
-    const { data, error } = await supabase
-      .from('chapters')
-      .select('*')
-      .eq('course_id', course.id)
-      .order('created_at', { ascending: true });
-      
-    if (data) {
-      setChapters(data);
-      if (data.length > 0 && !activeChapterId) {
-        setActiveChapterId(data[0].id);
-      }
-    }
-  };
-
-  const [activeTab, setActiveTab] = useState<'material' | 'reading' | 'quiz' | 'analytics'>('material');
-  const [submissions, setSubmissions] = useState<any[]>([]);
-  const [isLoadingSubmissions, setIsLoadingSubmissions] = useState(false);
-  const [readingPrompt, setReadingPrompt] = useState('');
-  const [isGeneratingReading, setIsGeneratingReading] = useState(false);
-  const [editingReading, setEditingReading] = useState('');
-  const [isEditingReading, setIsEditingReading] = useState(false);
 
   useEffect(() => {
     if (activeChapterId && activeTab === 'analytics') {
@@ -84,7 +219,91 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
     }
   }, [activeChapterId, activeTab]);
 
+  useEffect(() => {
+    if (chapters.length === 0) {
+      setActiveChapterId(null);
+      return;
+    }
+
+    if (!activeChapterId || !chapters.some((c) => c.id === activeChapterId)) {
+      setActiveChapterId(chapters[0].id);
+    }
+  }, [chapters, activeChapterId]);
+
+  useEffect(() => {
+    const chapterSubscription = supabase
+      .channel(`teacher-chapters-${course.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'chapters',
+          filter: `course_id=eq.${course.id}`,
+        },
+        () => {
+          fetchChapters();
+        }
+      )
+      .subscribe();
+
+    const submissionSubscription = supabase
+      .channel(`teacher-submissions-${course.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'quiz_submissions',
+        },
+        () => {
+          if (activeTab === 'analytics' && activeChapterId) {
+            fetchSubmissions();
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      chapterSubscription.unsubscribe();
+      submissionSubscription.unsubscribe();
+    };
+  }, [course.id, activeTab, activeChapterId]);
+
+  useEffect(() => {
+    if (!activeChapter) return;
+
+    const status = normalizeStatus(activeChapter);
+    if (!['queued', 'processing'].includes(status)) return;
+
+    const interval = setInterval(() => {
+      fetchChapters();
+      if (activeTab === 'analytics' && activeChapterId) {
+        fetchSubmissions();
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [activeChapter, activeTab, activeChapterId]);
+
+  const fetchChapters = async () => {
+    const { data, error } = await supabase
+      .from('chapters')
+      .select('*')
+      .eq('course_id', course.id)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching chapters:', error);
+      return;
+    }
+
+    setChapters((data || []) as Chapter[]);
+  };
+
   const fetchSubmissions = async () => {
+    if (!activeChapterId) return;
+
     setIsLoadingSubmissions(true);
     try {
       const { data, error } = await supabase
@@ -92,7 +311,7 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
         .select('*')
         .eq('chapter_id', activeChapterId)
         .order('created_at', { ascending: false });
-      
+
       if (error) throw error;
       setSubmissions(data || []);
     } catch (err) {
@@ -102,22 +321,24 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
     }
   };
 
-  const activeChapter = chapters.find(c => c.id === activeChapterId);
-
   const calculateAnalytics = () => {
-    if (submissions.length === 0 || !activeChapter?.quiz) return null;
-    
-    const totalStudents = new Set(submissions.map(s => s.student_id)).size;
-    const avgScore = (submissions.reduce((acc, s) => acc + s.score, 0) / submissions.length).toFixed(1);
-    
-    // Calculate accuracy per question
+    if (submissions.length === 0 || !activeChapter?.quiz?.length) return null;
+
+    const totalStudents = new Set(submissions.map((s) => s.student_id)).size;
+    const avgScore = (
+      submissions.reduce((acc, s) => acc + s.score, 0) / submissions.length
+    ).toFixed(1);
+
     const questionStats = activeChapter.quiz.map((q: any, qIdx: number) => {
-      const correctCount = submissions.filter(s => s.answers[qIdx] === q.correctAnswerIndex).length;
-      const accuracy = (correctCount / submissions.length) * 100;
+      const correctCount = submissions.filter(
+        (s) => s.answers?.[qIdx] === q.correctAnswerIndex
+      ).length;
+      const accuracy = submissions.length ? (correctCount / submissions.length) * 100 : 0;
+
       return {
         question: q.question,
         accuracy: accuracy.toFixed(1),
-        isLowAccuracy: accuracy < 50
+        isLowAccuracy: accuracy < 50,
       };
     });
 
@@ -125,11 +346,23 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
       totalCompletions: submissions.length,
       totalStudents,
       avgScore,
-      questionStats
+      questionStats,
     };
   };
 
   const analytics = calculateAnalytics();
+
+  const updateChapter = async (id: string, updates: Partial<Chapter>) => {
+    const { error } = await supabase.from('chapters').update(updates).eq('id', id);
+
+    if (error) {
+      console.error('Failed to update chapter:', error);
+      alert(`Failed to update chapter: ${error.message}`);
+      throw error;
+    }
+
+    setChapters((prev) => prev.map((c) => (c.id === id ? { ...c, ...updates } : c)));
+  };
 
   const handleCreateChapter = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -137,38 +370,32 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
 
     const { data, error } = await supabase
       .from('chapters')
-      .insert([{
-        course_id: course.id,
-        title: newChapterTitle.trim(),
-        quiz: []
-      }])
+      .insert([
+        {
+          course_id: course.id,
+          title: newChapterTitle.trim(),
+          quiz: [],
+          ppt: null,
+          extracted_text: null,
+          content_status: 'idle',
+          processing_stage: null,
+          processing_progress: 0,
+          processing_error: null,
+        },
+      ])
       .select()
       .single();
 
-    if (data) {
-      setChapters([...chapters, data]);
-      setActiveChapterId(data.id);
-      setNewChapterTitle('');
-      setIsCreatingChapter(false);
-    } else {
+    if (error || !data) {
       console.error(error);
-      alert('Failed to create chapter. Please ensure you have run the updated SQL schema.');
+      alert('Failed to create chapter. Please ensure your latest SQL schema has been applied.');
+      return;
     }
-  };
 
-  const updateChapter = async (id: string, updates: Partial<Chapter>) => {
-    const { error } = await supabase
-      .from('chapters')
-      .update(updates)
-      .eq('id', id);
-      
-    if (!error) {
-      setChapters(chapters.map(c => c.id === id ? { ...c, ...updates } : c));
-    } else {
-      console.error('Failed to update chapter:', error);
-      alert(`Failed to update chapter: ${error.message}`);
-      throw error;
-    }
+    setChapters((prev) => [...prev, data as Chapter]);
+    setActiveChapterId(data.id);
+    setNewChapterTitle('');
+    setIsCreatingChapter(false);
   };
 
   const handleUpdateChapterTitle = async () => {
@@ -177,48 +404,173 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
     setIsEditingChapterTitle(false);
   };
 
+  const processingTriggerRef = useRef<Record<string, boolean>>({});
+
+  const triggerAutoProcessing = async (
+    chapter: Chapter,
+    fileMeta: { fileUrl: string; fileName: string; mimeType: string }
+  ) => {
+    if (processingTriggerRef.current[chapter.id]) {
+      console.warn('[triggerAutoProcessing] duplicate blocked', chapter.id);
+      return;
+    }
+
+    processingTriggerRef.current[chapter.id] = true;
+
+    try {
+      const response = await fetch('/api/process-chapter-material', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chapterId: chapter.id,
+          chapterTitle: chapter.title,
+          fileUrl: fileMeta.fileUrl,
+          fileName: fileMeta.fileName,
+          mimeType: fileMeta.mimeType,
+        }),
+      });
+
+      const rawText = await response.text();
+      let result: any = null;
+
+      try {
+        result = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        console.error('[triggerAutoProcessing] non-JSON response:', rawText);
+      }
+
+      console.log('[triggerAutoProcessing] response status:', response.status);
+      console.log('[triggerAutoProcessing] response body:', result || rawText);
+
+      if (!response.ok) {
+        throw new Error(
+          result?.error ||
+            `Processing request failed with status ${response.status}`
+        );
+      }
+
+      // 后端返回 ok:true 即认为启动成功
+      if (result?.ok) {
+        await fetchChapters();
+        return;
+      }
+
+      throw new Error(result?.error || 'Failed to start chapter processing.');
+    } catch (error: any) {
+      console.error('Auto processing trigger failed:', error);
+
+      // 关键：不要立刻写 failed
+      // 因为长任务接口可能只是慢/超时，后端未必真的没在跑
+      await fetchChapters();
+
+      // 可选：如果你一定要展示提示，用 alert 或 toast，但不要把数据库状态直接打成 failed
+      alert(error?.message || 'Processing request did not complete normally. Please check again in a moment.');
+    } finally {
+      processingTriggerRef.current[chapter.id] = false;
+    }
+  };
+
+  const handleRetryProcessing = async () => {
+    if (!activeChapter || !activeChapter.ppt?.supabaseUrl) return;
+
+    const nextPpt: ChapterPptMeta = {
+      ...activeChapter.ppt,
+      relevant_reading: null,
+      is_reading_published: false,
+    };
+
+    await updateChapter(activeChapter.id, {
+      ppt: nextPpt,
+      quiz: [],
+      extracted_text: null,
+      content_status: 'idle',
+      processing_stage: null,
+      processing_progress: 0,
+      processing_error: null,
+    });
+
+    await triggerAutoProcessing(activeChapter, {
+      fileUrl: activeChapter.ppt.supabaseUrl,
+      fileName: activeChapter.ppt.originalName || 'document',
+      mimeType: activeChapter.mime_type || 'application/pdf',
+    });
+  };
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !activeChapterId) return;
+    if (!file || !activeChapterId || !activeChapter) return;
 
     setIsUploading(true);
     setUploadProgress(10);
 
     try {
-      // 1. Upload to Supabase Storage for permanent cloud hosting
       const fileExt = file.name.split('.').pop();
       const fileName = `${Math.random().toString(36).substring(2)}-${Date.now()}.${fileExt}`;
       const filePath = `${course.id}/${fileName}`;
 
       setUploadProgress(30);
+
       const { error: uploadError } = await supabase.storage
         .from('course-materials')
-        .upload(filePath, file);
+        .upload(filePath, file, { upsert: true });
 
       if (uploadError) {
         console.error('Supabase upload error:', uploadError);
-        throw new Error('Failed to upload file to cloud storage. Please ensure the "course-materials" bucket exists in Supabase.');
+        throw new Error(
+          'Failed to upload file to cloud storage. Please ensure the "course-materials" bucket exists and is accessible.'
+        );
       }
 
-      const { data: { publicUrl } } = supabase.storage
-        .from('course-materials')
-        .getPublicUrl(filePath);
+      setUploadProgress(70);
 
-      setUploadProgress(60);
+      const {
+        data: { publicUrl },
+      } = supabase.storage.from('course-materials').getPublicUrl(filePath);
 
-      // 2. Update database record
+      const nextPpt: ChapterPptMeta = {
+        supabaseUrl: publicUrl,
+        originalName: file.name,
+        storagePath: filePath,
+        relevant_reading: null,
+        is_reading_published: false,
+        last_processed_at: null,
+      };
+
       await updateChapter(activeChapterId, {
         file_uri: publicUrl,
         mime_type: file.type,
-        ppt: {
-          supabaseUrl: publicUrl,
-          originalName: file.name
-        },
-        quiz: []
+        ppt: nextPpt,
+        quiz: [],
+        extracted_text: null,
+        content_status: 'idle',
+        processing_stage: null,
+        processing_progress: 0,
+        processing_error: null,
       });
-      
+
       setUploadProgress(100);
-      
+
+      // 上传成功后自动触发处理，不需要老师手动再点
+      void triggerAutoProcessing(
+        {
+          ...activeChapter,
+          id: activeChapterId,
+          file_uri: publicUrl,
+          mime_type: file.type,
+          ppt: nextPpt,
+          quiz: [],
+          extracted_text: null,
+          content_status: 'queued',
+          processing_stage: 'queued',
+          processing_progress: 5,
+          processing_error: null,
+        },
+        {
+          fileUrl: publicUrl,
+          fileName: file.name,
+          mimeType: file.type,
+        }
+      );
     } catch (error: any) {
       console.error('Error uploading file:', error);
       alert(error.message || 'Failed to upload file');
@@ -231,173 +583,383 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
     }
   };
 
-  const generateReading = async () => {
-    if (!activeChapter?.ppt?.supabaseUrl || !activeChapterId) return;
+  const renderStatusBadge = (chapter?: Chapter | null) => {
+    const status = normalizeStatus(chapter);
 
-    setIsGeneratingReading(true);
-    try {
-      // Fetch the file and convert to base64
-      const fileResponse = await fetch(activeChapter.ppt.supabaseUrl);
-      const blob = await fileResponse.blob();
-      
-      const reader = new FileReader();
-      const fileBase64Promise = new Promise<string>((resolve, reject) => {
-        reader.onload = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          resolve(base64);
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      });
-
-      const fileBase64 = await fileBase64Promise;
-      
-      const prompt = `You are a professional academic content creator. Based on the provided document and the teacher's request, write a high-quality, narrative-style supplementary reading material for students.
-      
-      Teacher's Request: "${readingPrompt || 'Provide relevant case studies and supplementary reading materials for the core concepts in this chapter.'}"
-      
-      CRITICAL GUIDELINES:
-      1. NO INTRODUCTIONS OR OUTROS: Do not say things like "Here is the material..." or "I hope this helps...". Start the content immediately with the first paragraph.
-      2. NARRATIVE ESSAY STYLE: Strictly avoid bullet points, numbered lists, or "分点回答". Write in a flowing, professional essay or article format. Use clear, descriptive paragraphs.
-      3. NO BOLDING OR ITALICS: Do NOT use "**" for bolding or "_" for italics. Use plain text only.
-      4. MINIMAL HEADERS: Use only one or two simple headers if absolutely necessary for major sections, otherwise use paragraph breaks.
-      5. STUDENT-FACING: The content must be written directly for students as a "Course Extension" or "Deep Dive".
-      
-      Language: Use the same language as the provided document (likely Chinese).`;
-      
-      const response = await genAI.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
-        contents: [
-          {
-            parts: [
-              {
-                inlineData: {
-                  data: fileBase64,
-                  mimeType: activeChapter.mime_type || 'application/pdf'
-                }
-              },
-              { text: prompt }
-            ]
-          }
-        ],
-        config: {
-          tools: [{ googleSearch: {} }],
-        }
-      });
-
-      const text = response.text;
-      
-      const updatedPpt = {
-        ...activeChapter.ppt,
-        relevant_reading: text,
-        is_reading_published: false
-      };
-
-      await updateChapter(activeChapterId, { ppt: updatedPpt });
-      setReadingPrompt('');
-      setEditingReading(text);
-      setIsEditingReading(true);
-      
-    } catch (error: any) {
-      console.error('Error generating reading material:', error);
-      alert(`Failed to generate reading material: ${error.message}`);
-    } finally {
-      setIsGeneratingReading(false);
+    if (status === 'ready') {
+      return (
+        <span className="px-3 py-1 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1">
+          <CheckCircle2 className="w-3 h-3" />
+          Ready
+        </span>
+      );
     }
+
+    if (status === 'failed') {
+      return (
+        <span className="px-3 py-1 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1">
+          <AlertCircle className="w-3 h-3" />
+          Failed
+        </span>
+      );
+    }
+
+    if (status === 'queued' || status === 'processing') {
+      return (
+        <span className="px-3 py-1 bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1">
+          <Clock3 className="w-3 h-3" />
+          {status === 'queued' ? 'Queued' : 'Processing'}
+        </span>
+      );
+    }
+
+    return (
+      <span className="px-3 py-1 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-full text-xs font-bold uppercase tracking-wider">
+        Idle
+      </span>
+    );
   };
-  const generateQuiz = async (force = false) => {
-    if (!activeChapter?.ppt?.supabaseUrl || !activeChapterId) return;
-    if (activeChapter.quiz && activeChapter.quiz.length > 0 && !force) {
-      setShowRegenConfirm(true);
-      return;
+
+  const renderProcessingPanel = (chapter: Chapter) => {
+    const status = normalizeStatus(chapter);
+    const progress = getProgress(chapter);
+    const stageLabel = getStageLabel(chapter);
+
+    if (!chapter.ppt?.supabaseUrl) return null;
+
+    return (
+      <div className="bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded-2xl p-6">
+        <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4 mb-4">
+          <div className="flex items-start gap-3">
+            <div
+              className={`p-3 rounded-xl ${
+                status === 'ready'
+                  ? 'bg-emerald-100 dark:bg-emerald-900/30'
+                  : status === 'failed'
+                  ? 'bg-red-100 dark:bg-red-900/30'
+                  : 'bg-amber-100 dark:bg-amber-900/30'
+              }`}
+            >
+              {status === 'ready' ? (
+                <CheckCircle2 className="w-6 h-6 text-emerald-600 dark:text-emerald-400" />
+              ) : status === 'failed' ? (
+                <AlertCircle className="w-6 h-6 text-red-600 dark:text-red-400" />
+              ) : (
+                <Loader2 className="w-6 h-6 text-amber-600 dark:text-amber-400 animate-spin" />
+              )}
+            </div>
+
+            <div>
+              <div className="flex items-center gap-3 flex-wrap">
+                <p className="font-semibold text-slate-800 dark:text-slate-200">
+                  {chapter.ppt?.originalName || 'Uploaded document'}
+                </p>
+                {renderStatusBadge(chapter)}
+              </div>
+              <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+                Upload is automatic. After upload, the system will extract content, generate reading material,
+                and prepare the chapter quiz for you.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-2">
+            {status === 'failed' && (
+              <button
+                onClick={handleRetryProcessing}
+                className="px-4 py-2 bg-indigo-600 text-white rounded-xl font-medium hover:bg-indigo-700 transition-colors flex items-center gap-2"
+              >
+                <RotateCcw size={16} />
+                Retry Processing
+              </button>
+            )}
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="px-4 py-2 bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl font-medium hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors"
+            >
+              Upload Another
+            </button>
+          </div>
+        </div>
+
+        {(status === 'queued' || status === 'processing' || status === 'ready') && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-slate-600 dark:text-slate-300 font-medium">
+                {status === 'ready' ? 'Processing completed' : `Current stage: ${stageLabel}`}
+              </span>
+              <span className="text-slate-500 dark:text-slate-400">{progress}%</span>
+            </div>
+            <div className="w-full h-3 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+              <div
+                className={`h-full transition-all duration-500 ${
+                  status === 'ready' ? 'bg-emerald-500' : 'bg-indigo-500'
+                }`}
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {status === 'failed' && chapter.processing_error && (
+          <div className="mt-4 bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800/30 rounded-xl p-4">
+            <p className="text-sm font-semibold text-red-700 dark:text-red-400 mb-1">Processing failed</p>
+            <p className="text-sm text-red-600 dark:text-red-300">{chapter.processing_error}</p>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderReadingTab = () => {
+    if (!activeChapter) return null;
+
+    if (!activeChapter.ppt?.supabaseUrl) {
+      return (
+        <div className="text-center py-16 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+          <BookOpen className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">No Material Uploaded Yet</h3>
+          <p className="text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+            Upload a PDF or PPT in the Course Material tab first. Relevant Reading will be generated automatically.
+          </p>
+        </div>
+      );
     }
 
-    setShowRegenConfirm(false);
-    setIsGeneratingQuiz(true);
-    try {
-      // 1. Delete existing submissions for this chapter
-      const { error: deleteError } = await supabase
-        .from('quiz_submissions')
-        .delete()
-        .eq('chapter_id', activeChapterId);
-      
-      if (deleteError) throw deleteError;
-
-      // 2. Fetch the file and convert to base64
-      const fileResponse = await fetch(activeChapter.ppt.supabaseUrl);
-      const blob = await fileResponse.blob();
-      
-      const reader = new FileReader();
-      const fileBase64Promise = new Promise<string>((resolve, reject) => {
-        reader.onload = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          resolve(base64);
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      });
-
-      const fileBase64 = await fileBase64Promise;
-      
-      const prompt = `Based on the provided document, generate exactly 10 multiple-choice questions. 
-      Output MUST be a JSON array of objects with this exact structure:
-      [
-        {
-          "question": "The question text",
-          "options": ["Option A", "Option B", "Option C", "Option D"],
-          "correctAnswerIndex": 0, // index of the correct option (0-3)
-          "explanation": "Detailed explanation of why this is correct"
-        }
-      ]
-      Ensure the questions cover the core concepts of the document.`;
-      
-      const response = await genAI.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: [
-          {
-            parts: [
-              {
-                inlineData: {
-                  data: fileBase64,
-                  mimeType: activeChapter.mime_type || 'application/pdf'
-                }
-              },
-              { text: prompt }
-            ]
-          }
-        ]
-      });
-
-      const text = response.text;
-      
-      // Clean up JSON if model wrapped it in markdown
-      const jsonMatch = text.match(/\[[\s\S]*\]/);
-      const quizData = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(text);
-
-      // Ensure correctAnswerIndex is a number
-      const sanitizedQuizData = quizData.map((q: any) => ({
-        ...q,
-        correctAnswerIndex: Number(q.correctAnswerIndex)
-      }));
-
-      await updateChapter(activeChapterId, { quiz: sanitizedQuizData });
-      
-      // Refresh submissions (should be empty now)
-      setSubmissions([]);
-      if (activeTab === 'analytics') {
-        fetchSubmissions();
-      }
-    } catch (error: any) {
-      console.error('Error generating Quiz:', error);
-      alert(`Failed to generate Quiz: ${error.message}`);
-    } finally {
-      setIsGeneratingQuiz(false);
+    if (activeChapterStatus === 'queued' || activeChapterStatus === 'processing') {
+      return (
+        <div className="space-y-6">
+          {renderProcessingPanel(activeChapter)}
+          <div className="text-center py-12 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+            <Loader2 className="w-10 h-10 animate-spin text-indigo-500 mx-auto mb-4" />
+            <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">
+              Reading Material is Being Prepared
+            </h3>
+            <p className="text-slate-500 dark:text-slate-400">
+              Current stage: <span className="font-medium">{activeChapterStageLabel}</span> · {activeChapterProgress}%
+            </p>
+          </div>
+        </div>
+      );
     }
+
+    if (activeChapterStatus === 'failed') {
+      return (
+        <div className="space-y-6">
+          {renderProcessingPanel(activeChapter)}
+          <div className="text-center py-12 bg-red-50 dark:bg-red-900/10 rounded-2xl border border-red-100 dark:border-red-800/30">
+            <AlertCircle className="w-10 h-10 text-red-500 mx-auto mb-4" />
+            <h3 className="text-lg font-semibold text-red-700 dark:text-red-400 mb-2">Automatic Processing Failed</h3>
+            <p className="text-red-600 dark:text-red-300 max-w-md mx-auto">
+              {activeChapter.processing_error || 'The system could not finish processing this file.'}
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    if (!activeChapter.ppt?.relevant_reading) {
+      return (
+        <div className="text-center py-16 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+          <BookOpen className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">No Reading Material Found</h3>
+          <p className="text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+            The file finished processing, but no supplementary reading was written back to the chapter.
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-6">
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm">
+          <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+            <h3 className="text-lg font-semibold text-slate-800 dark:text-slate-200">
+              Auto-generated Relevant Reading
+            </h3>
+            <div className="flex items-center gap-3">
+              {activeChapter.ppt.is_reading_published ? (
+                <span className="px-3 py-1 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1">
+                  <Eye className="w-3 h-3" />
+                  Published
+                </span>
+              ) : (
+                <span className="px-3 py-1 bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1">
+                  <EyeOff className="w-3 h-3" />
+                  Draft
+                </span>
+              )}
+            </div>
+          </div>
+
+          {isEditingReading ? (
+            <div className="space-y-4">
+              <textarea
+                value={editingReading}
+                onChange={(e) => setEditingReading(e.target.value)}
+                className="w-full h-96 p-4 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl font-mono text-sm text-slate-800 dark:text-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none resize-y"
+              />
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => {
+                    setIsEditingReading(false);
+                    setEditingReading(activeChapter.ppt?.relevant_reading || '');
+                  }}
+                  className="px-4 py-2 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-xl font-medium transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={async () => {
+                    const updatedPpt = {
+                      ...(activeChapter.ppt || {}),
+                      relevant_reading: editingReading,
+                    };
+                    await updateChapter(activeChapter.id, { ppt: updatedPpt });
+                    setIsEditingReading(false);
+                  }}
+                  className="px-4 py-2 bg-indigo-600 text-white rounded-xl font-medium hover:bg-indigo-700 transition-colors flex items-center gap-2"
+                >
+                  <Check size={16} /> Save Changes
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="prose prose-slate dark:prose-invert max-w-none prose-sm bg-slate-50 dark:bg-slate-900/50 p-6 rounded-xl border border-slate-100 dark:border-slate-800">
+                <Markdown>{activeChapter.ppt.relevant_reading || ''}</Markdown>
+              </div>
+
+              <div className="flex gap-3 justify-end pt-2 flex-wrap">
+                <button
+                  onClick={() => {
+                    setEditingReading(activeChapter.ppt?.relevant_reading || '');
+                    setIsEditingReading(true);
+                  }}
+                  className="px-4 py-2 text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-900/30 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-xl font-medium transition-colors flex items-center gap-2"
+                >
+                  <Edit2 size={16} /> Edit Content
+                </button>
+
+                <button
+                  onClick={async () => {
+                    const isPublished = !activeChapter.ppt?.is_reading_published;
+                    const updatedPpt = {
+                      ...(activeChapter.ppt || {}),
+                      is_reading_published: isPublished,
+                    };
+                    await updateChapter(activeChapter.id, { ppt: updatedPpt });
+                  }}
+                  className={`px-4 py-2 rounded-xl font-medium transition-colors flex items-center gap-2 ${
+                    activeChapter.ppt?.is_reading_published
+                      ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50'
+                      : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                  }`}
+                >
+                  {activeChapter.ppt?.is_reading_published ? (
+                    <>
+                      <EyeOff size={16} /> Unpublish
+                    </>
+                  ) : (
+                    <>
+                      <Eye size={16} /> Publish to Students
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderQuizTab = () => {
+    if (!activeChapter) return null;
+
+    if (!activeChapter.ppt?.supabaseUrl) {
+      return (
+        <div className="text-center py-12 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+          <HelpCircle className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">No Quiz Available Yet</h3>
+          <p className="text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
+            Upload a chapter document first. The quiz will be generated automatically after processing.
+          </p>
+        </div>
+      );
+    }
+
+    if (activeChapterStatus === 'queued' || activeChapterStatus === 'processing') {
+      return (
+        <div className="space-y-6">
+          {renderProcessingPanel(activeChapter)}
+          <div className="text-center py-12 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+            <Loader2 className="w-10 h-10 animate-spin text-violet-500 mx-auto mb-4" />
+            <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">
+              Quiz is Being Generated
+            </h3>
+            <p className="text-slate-500 dark:text-slate-400">
+              Current stage: <span className="font-medium">{activeChapterStageLabel}</span> · {activeChapterProgress}%
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    if (activeChapterStatus === 'failed') {
+      return (
+        <div className="space-y-6">
+          {renderProcessingPanel(activeChapter)}
+          <div className="text-center py-12 bg-red-50 dark:bg-red-900/10 rounded-2xl border border-red-100 dark:border-red-800/30">
+            <AlertCircle className="w-10 h-10 text-red-500 mx-auto mb-4" />
+            <h3 className="text-lg font-semibold text-red-700 dark:text-red-400 mb-2">Quiz Generation Failed</h3>
+            <p className="text-red-600 dark:text-red-300 max-w-md mx-auto">
+              {activeChapter.processing_error || 'The system could not finish processing this file.'}
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    if (!activeChapter.quiz || activeChapter.quiz.length === 0) {
+      return (
+        <div className="text-center py-12 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+          <HelpCircle className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">No Quiz Generated</h3>
+          <p className="text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
+            Processing finished, but no quiz was written back to the chapter record.
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
+          <div className="flex items-center gap-2">
+            <span className="px-3 py-1 bg-indigo-100 text-indigo-700 rounded-full text-xs font-bold uppercase tracking-wider">
+              {activeChapter.quiz.length} Questions
+            </span>
+            <span className="text-slate-400 text-sm">•</span>
+            <span className="text-slate-500 text-sm italic">Auto Generated</span>
+          </div>
+
+          <button
+            onClick={handleRetryProcessing}
+            className="text-sm text-indigo-600 font-semibold hover:text-indigo-700 flex items-center gap-1"
+          >
+            <RotateCcw size={14} />
+            Reprocess Material
+          </button>
+        </div>
+
+        <QuizViewer questions={activeChapter.quiz} isTeacherView={true} />
+      </div>
+    );
   };
 
   return (
     <div className="flex gap-6 h-[calc(100vh-8rem)]">
-      {/* Left Sidebar: Chapters List */}
       {isLeftSidebarOpen && (
         <div className="w-80 flex-shrink-0 bg-white dark:bg-slate-800 rounded-2xl shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col h-full transition-all">
           <div className="p-3 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
@@ -406,14 +968,14 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
               Chapters
             </h3>
             <div className="flex items-center gap-1">
-              <button 
+              <button
                 onClick={() => setIsCreatingChapter(true)}
                 className="p-1.5 bg-indigo-100 text-indigo-700 rounded-lg hover:bg-indigo-200 transition-colors"
                 title="Add Chapter"
               >
                 <Plus className="w-4 h-4" />
               </button>
-              <button 
+              <button
                 onClick={() => setIsLeftSidebarOpen(false)}
                 className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg"
                 title="Close Sidebar"
@@ -435,52 +997,94 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
                   className="w-full px-3 py-2 text-sm border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-700 text-slate-900 dark:text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
                 <div className="flex gap-2 mt-2">
-                  <button type="submit" className="text-xs px-3 py-1.5 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">Save</button>
-                  <button type="button" onClick={() => setIsCreatingChapter(false)} className="text-xs px-3 py-1.5 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-md hover:bg-slate-200 dark:hover:bg-slate-600">Cancel</button>
+                  <button
+                    type="submit"
+                    className="text-xs px-3 py-1.5 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
+                  >
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsCreatingChapter(false)}
+                    className="text-xs px-3 py-1.5 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-md hover:bg-slate-200 dark:hover:bg-slate-600"
+                  >
+                    Cancel
+                  </button>
                 </div>
               </form>
             )}
 
             {chapters.length === 0 && !isCreatingChapter ? (
-              <div className="text-center py-8 text-slate-500 text-sm">
-                No chapters yet. Click + to add one.
-              </div>
+              <div className="text-center py-8 text-slate-500 text-sm">No chapters yet. Click + to add one.</div>
             ) : (
-              chapters.map((chapter, idx) => (
-                <button
-                  key={chapter.id}
-                  onClick={() => {
-                    setActiveChapterId(chapter.id);
-                  }}
-                  className={`w-full text-left px-4 py-3 rounded-xl flex items-center justify-between group transition-all ${
-                    activeChapterId === chapter.id 
-                      ? 'bg-indigo-50 border border-indigo-200 text-indigo-900 dark:bg-indigo-900/30 dark:border-indigo-800 dark:text-indigo-100' 
-                      : 'hover:bg-slate-50 border border-transparent text-slate-700 dark:text-slate-300 dark:hover:bg-slate-700/50'
-                  }`}
-                >
-                  <div className="flex items-center gap-3 overflow-hidden">
-                    <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${
-                      activeChapterId === chapter.id ? 'bg-indigo-200 text-indigo-800' : 'bg-slate-100 text-slate-500'
-                    }`}>
-                      {idx + 1}
+              chapters.map((chapter, idx) => {
+                const status = normalizeStatus(chapter);
+
+                return (
+                  <button
+                    key={chapter.id}
+                    onClick={() => setActiveChapterId(chapter.id)}
+                    className={`w-full text-left px-4 py-3 rounded-xl group transition-all border ${
+                      activeChapterId === chapter.id
+                        ? 'bg-indigo-50 border-indigo-200 text-indigo-900 dark:bg-indigo-900/30 dark:border-indigo-800 dark:text-indigo-100'
+                        : 'hover:bg-slate-50 border-transparent text-slate-700 dark:text-slate-300 dark:hover:bg-slate-700/50'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-3 overflow-hidden min-w-0">
+                        <div
+                          className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium flex-shrink-0 mt-0.5 ${
+                            activeChapterId === chapter.id
+                              ? 'bg-indigo-200 text-indigo-800'
+                              : 'bg-slate-100 text-slate-500'
+                          }`}
+                        >
+                          {idx + 1}
+                        </div>
+                        <div className="min-w-0">
+                          <span className="font-medium truncate block">{chapter.title}</span>
+                          <div className="mt-1 flex items-center gap-2 flex-wrap">
+                            {status === 'ready' && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 font-bold uppercase tracking-wider">
+                                Ready
+                              </span>
+                            )}
+                            {(status === 'queued' || status === 'processing') && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 font-bold uppercase tracking-wider">
+                                {getProgress(chapter)}%
+                              </span>
+                            )}
+                            {status === 'failed' && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 font-bold uppercase tracking-wider">
+                                Failed
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <ChevronRight
+                        className={`w-4 h-4 flex-shrink-0 mt-1 ${
+                          activeChapterId === chapter.id
+                            ? 'text-indigo-400'
+                            : 'text-slate-300 opacity-0 group-hover:opacity-100'
+                        }`}
+                      />
                     </div>
-                    <span className="font-medium truncate">{chapter.title}</span>
-                  </div>
-                  <ChevronRight className={`w-4 h-4 ${activeChapterId === chapter.id ? 'text-indigo-400' : 'text-slate-300 opacity-0 group-hover:opacity-100'}`} />
-                </button>
-              ))
+                  </button>
+                );
+              })
             )}
           </div>
         </div>
       )}
 
-      {/* Right Content Area */}
       <div className="flex-1 flex flex-col min-w-0 h-full overflow-y-auto pr-2 space-y-8">
         {!activeChapter ? (
           <div className="bg-white dark:bg-slate-800 p-12 rounded-2xl shadow-sm border border-slate-200 dark:border-slate-700 text-center flex flex-col items-center justify-center h-full relative">
             <div className="flex items-center gap-4 absolute top-8 left-8">
               {!isLeftSidebarOpen && (
-                <button 
+                <button
                   onClick={() => setIsLeftSidebarOpen(true)}
                   className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg"
                   title="Open Sidebar"
@@ -489,12 +1093,17 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
                 </button>
               )}
             </div>
+
             <div className="bg-indigo-50 dark:bg-indigo-900/30 p-4 rounded-full mb-4">
               <BookOpen className="w-12 h-12 text-indigo-300 dark:text-indigo-500" />
             </div>
-            <h2 className="text-2xl font-semibold text-slate-800 dark:text-slate-200 mb-2">Select or Create a Chapter</h2>
+
+            <h2 className="text-2xl font-semibold text-slate-800 dark:text-slate-200 mb-2">
+              Select or Create a Chapter
+            </h2>
             <p className="text-slate-500 dark:text-slate-400 max-w-md mb-8">
-              Organize your course into chapters. Each chapter can have its own PDF/PPT material and quiz.
+              Organize your course into chapters. Uploading a chapter document will automatically trigger extraction,
+              reading generation, and quiz generation.
             </p>
 
             <div className="w-full max-w-2xl bg-slate-50 dark:bg-slate-900/50 rounded-2xl p-8 border border-slate-200 dark:border-slate-700">
@@ -509,525 +1118,346 @@ export default function TeacherDashboard({ course, user }: TeacherDashboardProps
                 </div>
                 <div>
                   <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1">Description</p>
-                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">{course.description || 'No description provided.'}</p>
+                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
+                    {course.description || 'No description provided.'}
+                  </p>
                 </div>
               </div>
             </div>
           </div>
         ) : (
-          <>
-            <div className="bg-white dark:bg-slate-800 p-8 rounded-2xl shadow-sm border border-slate-100 dark:border-slate-700 relative">
-              <div className="flex items-center gap-4 absolute top-8 left-8">
-                {!isLeftSidebarOpen && (
-                  <button 
-                    onClick={() => setIsLeftSidebarOpen(true)}
-                    className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg"
-                    title="Open Sidebar"
-                  >
-                    <PanelLeftOpen className="w-5 h-5" />
-                  </button>
-                )}
-              </div>
-              <div className={`flex items-center gap-4 mb-6 ${!isLeftSidebarOpen ? 'ml-12' : ''}`}>
-                <div className="flex-1 flex items-center gap-2">
-                  <FileText className="text-indigo-500 flex-shrink-0" />
-                  {isEditingChapterTitle ? (
-                    <div className="flex items-center gap-2 flex-1">
-                      <input 
-                        type="text"
-                        autoFocus
-                        value={editedChapterTitle}
-                        onChange={(e) => setEditedChapterTitle(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && handleUpdateChapterTitle()}
-                        className="flex-1 text-2xl font-semibold bg-slate-50 border-b-2 border-indigo-500 outline-none px-1"
-                      />
-                      <button 
-                        onClick={handleUpdateChapterTitle}
-                        className="p-1.5 bg-emerald-100 text-emerald-700 rounded-lg hover:bg-emerald-200"
-                      >
-                        <Check size={20} />
-                      </button>
-                      <button 
-                        onClick={() => setIsEditingChapterTitle(false)}
-                        className="p-1.5 bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200"
-                      >
-                        <X size={20} />
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-3 group">
-                      <h2 className="text-2xl font-semibold text-slate-800 dark:text-white">
-                        {activeChapter.title}
-                      </h2>
-                      <button 
-                        onClick={() => {
-                          setEditedChapterTitle(activeChapter.title);
-                          setIsEditingChapterTitle(true);
-                        }}
-                        className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg opacity-0 group-hover:opacity-100 transition-all"
-                        title="Rename Chapter"
-                      >
-                        <Edit2 size={16} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex border-b border-slate-200 mb-8 overflow-x-auto">
+          <div className="bg-white dark:bg-slate-800 p-8 rounded-2xl shadow-sm border border-slate-100 dark:border-slate-700 relative">
+            <div className="flex items-center gap-4 absolute top-8 left-8">
+              {!isLeftSidebarOpen && (
                 <button
-                  onClick={() => setActiveTab('material')}
-                  className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
-                    activeTab === 'material' ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400' : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
-                  }`}
+                  onClick={() => setIsLeftSidebarOpen(true)}
+                  className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg"
+                  title="Open Sidebar"
                 >
-                  Course Material
+                  <PanelLeftOpen className="w-5 h-5" />
                 </button>
-                <button
-                  onClick={() => setActiveTab('reading')}
-                  className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
-                    activeTab === 'reading' ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400' : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
-                  }`}
-                >
-                  Relevant Reading
-                </button>
-                <button
-                  onClick={() => setActiveTab('quiz')}
-                  className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
-                    activeTab === 'quiz' ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400' : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
-                  }`}
-                >
-                  Chapter Quiz
-                </button>
-                <button
-                  onClick={() => setActiveTab('analytics')}
-                  className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
-                    activeTab === 'analytics' ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400' : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
-                  }`}
-                >
-                  Analytics
-                </button>
-              </div>
-              
-              {activeTab === 'material' && (
-                <>
-                  {!activeChapter.ppt?.supabaseUrl ? (
-                    <div 
-                      className="border-2 border-dashed border-slate-300 dark:border-slate-600 rounded-xl p-12 text-center hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors cursor-pointer"
-                      onClick={() => fileInputRef.current?.click()}
-                    >
-                      <input 
-                        type="file" 
-                        ref={fileInputRef} 
-                        className="hidden" 
-                        accept="application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                        onChange={handleFileUpload}
-                      />
-                      {isUploading ? (
-                        <div className="flex flex-col items-center gap-4">
-                          <Loader2 className="w-10 h-10 text-indigo-500 animate-spin" />
-                          <p className="text-slate-600 font-medium">Uploading and processing document... {uploadProgress}%</p>
-                          <div className="w-64 h-2 bg-slate-200 rounded-full overflow-hidden">
-                            <div 
-                              className="h-full bg-indigo-500 transition-all duration-300"
-                              style={{ width: `${uploadProgress}%` }}
-                            />
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="flex flex-col items-center gap-4">
-                          <div className="bg-indigo-50 dark:bg-indigo-900/30 p-4 rounded-full">
-                            <UploadCloud className="w-8 h-8 text-indigo-600 dark:text-indigo-400" />
-                          </div>
-                          <div>
-                            <p className="text-lg font-medium text-slate-700 dark:text-slate-300">Upload Teaching Material (PDF or PPT)</p>
-                            <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Drag and drop or click to browse</p>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="flex items-center justify-between bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-100 dark:border-emerald-800/30 p-4 rounded-xl">
-                      <div className="flex items-center gap-3">
-                        <CheckCircle2 className="text-emerald-500 dark:text-emerald-400 w-6 h-6" />
-                        <div>
-                          <p className="font-medium text-emerald-900 dark:text-emerald-100">Document Uploaded Successfully</p>
-                          <p className="text-sm text-emerald-700 dark:text-emerald-300">
-                            {activeChapter.ppt?.originalName || 'Ready for students'}
-                          </p>
-                        </div>
-                      </div>
-                      <button 
-                        onClick={() => updateChapter(activeChapterId, { file_uri: null, mime_type: null, ppt: null, quiz: [] })}
-                        className="text-sm text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 underline"
-                      >
-                        Upload another
-                      </button>
-                    </div>
-                  )}
-
-                  {activeChapter.ppt?.supabaseUrl && (
-                    <div className="mt-8">
-                      <button
-                        onClick={() => generateQuiz()}
-                        disabled={isGeneratingQuiz || (activeChapter.quiz && activeChapter.quiz.length > 0) || !activeChapter.file_uri}
-                        className="w-full flex items-center justify-center gap-2 py-4 px-6 bg-violet-600 text-white rounded-xl font-medium hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                      >
-                        {isGeneratingQuiz ? (
-                          <>
-                            <Loader2 className="w-5 h-5 animate-spin" />
-                            Generating 10 Questions...
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="w-5 h-5" />
-                            Generate AI Quiz
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-
-              {activeTab === 'reading' && (
-                <div className="space-y-6">
-                  <div className="bg-slate-50 dark:bg-slate-900/50 p-6 rounded-2xl border border-slate-200 dark:border-slate-700">
-                    <h3 className="text-lg font-semibold text-slate-800 dark:text-slate-200 mb-2">Generate Relevant Reading</h3>
-                    <p className="text-slate-600 dark:text-slate-400 mb-4 text-sm">
-                      Provide instructions for the AI to generate supplementary reading materials, case studies, or explanations for difficult concepts based on the uploaded course material.
-                    </p>
-                    <textarea
-                      value={readingPrompt}
-                      onChange={(e) => setReadingPrompt(e.target.value)}
-                      placeholder="e.g., Find 2 real-world case studies related to the core concepts in this chapter, focusing on the difficult parts."
-                      className="w-full px-4 py-3 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none resize-none mb-4"
-                      rows={4}
-                    />
-                    <button
-                      onClick={generateReading}
-                      disabled={isGeneratingReading || !activeChapter.file_uri}
-                      className="w-full flex items-center justify-center gap-2 py-3 px-6 bg-indigo-600 text-white rounded-xl font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {isGeneratingReading ? (
-                        <>
-                          <Loader2 className="w-5 h-5 animate-spin" />
-                          Generating Reading Material...
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles className="w-5 h-5" />
-                          Generate Reading Material
-                        </>
-                      )}
-                    </button>
-                  </div>
-
-                  {activeChapter.ppt?.relevant_reading && (
-                    <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm">
-                      <div className="flex items-center justify-between mb-4">
-                        <h3 className="text-lg font-semibold text-slate-800 dark:text-slate-200">Generated Reading Material</h3>
-                        <div className="flex items-center gap-3">
-                          {activeChapter.ppt.is_reading_published ? (
-                            <span className="px-3 py-1 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1">
-                              <Eye className="w-3 h-3" /> Published
-                            </span>
-                          ) : (
-                            <span className="px-3 py-1 bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 rounded-full text-xs font-bold uppercase tracking-wider flex items-center gap-1">
-                              <EyeOff className="w-3 h-3" /> Draft
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {isEditingReading ? (
-                        <div className="space-y-4">
-                          <textarea
-                            value={editingReading}
-                            onChange={(e) => setEditingReading(e.target.value)}
-                            className="w-full h-96 p-4 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl font-mono text-sm text-slate-800 dark:text-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none resize-y"
-                          />
-                          <div className="flex gap-3 justify-end">
-                            <button
-                              onClick={() => {
-                                setIsEditingReading(false);
-                                setEditingReading(activeChapter.ppt.relevant_reading);
-                              }}
-                              className="px-4 py-2 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-xl font-medium transition-colors"
-                            >
-                              Cancel
-                            </button>
-                            <button
-                              onClick={async () => {
-                                const updatedPpt = { ...activeChapter.ppt, relevant_reading: editingReading };
-                                await updateChapter(activeChapter.id, { ppt: updatedPpt });
-                                setIsEditingReading(false);
-                              }}
-                              className="px-4 py-2 bg-indigo-600 text-white rounded-xl font-medium hover:bg-indigo-700 transition-colors flex items-center gap-2"
-                            >
-                              <Check size={16} /> Save Changes
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="space-y-4">
-                          <div className="prose prose-slate dark:prose-invert max-w-none prose-sm bg-slate-50 dark:bg-slate-900/50 p-6 rounded-xl border border-slate-100 dark:border-slate-800">
-                            <Markdown>{activeChapter.ppt.relevant_reading}</Markdown>
-                          </div>
-                          <div className="flex gap-3 justify-end pt-2">
-                            <button
-                              onClick={() => {
-                                setEditingReading(activeChapter.ppt.relevant_reading);
-                                setIsEditingReading(true);
-                              }}
-                              className="px-4 py-2 text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-900/30 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-xl font-medium transition-colors flex items-center gap-2"
-                            >
-                              <Edit2 size={16} /> Edit Content
-                            </button>
-                            <button
-                              onClick={async () => {
-                                const isPublished = !activeChapter.ppt.is_reading_published;
-                                const updatedPpt = { ...activeChapter.ppt, is_reading_published: isPublished };
-                                await updateChapter(activeChapter.id, { ppt: updatedPpt });
-                              }}
-                              className={`px-4 py-2 rounded-xl font-medium transition-colors flex items-center gap-2 ${
-                                activeChapter.ppt.is_reading_published
-                                  ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50'
-                                  : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                              }`}
-                            >
-                              {activeChapter.ppt.is_reading_published ? (
-                                <>
-                                  <EyeOff size={16} /> Unpublish
-                                </>
-                              ) : (
-                                <>
-                                  <Eye size={16} /> Publish to Students
-                                </>
-                              )}
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {activeTab === 'quiz' && (
-                <div className="space-y-6">
-                  {!activeChapter.quiz || activeChapter.quiz.length === 0 ? (
-                    <div className="text-center py-12 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
-                      <HelpCircle className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" />
-                      <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">No Quiz Generated</h3>
-                      <p className="text-slate-500 dark:text-slate-400 mb-6 max-w-sm mx-auto">
-                        Generate a customized quiz based on your course material using AI.
-                      </p>
-                      <button
-                        onClick={() => generateQuiz()}
-                        disabled={isGeneratingQuiz || !activeChapter.file_uri}
-                        className="inline-flex items-center gap-2 bg-indigo-600 text-white px-6 py-3 rounded-xl font-semibold hover:bg-indigo-700 disabled:opacity-50 transition-all"
-                      >
-                        {isGeneratingQuiz ? (
-                          <>
-                            <Loader2 className="w-5 h-5 animate-spin" />
-                            Generating 10 Questions...
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="w-5 h-5" />
-                            Generate AI Quiz
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  ) : (
-                    <div>
-                      <div className="flex items-center justify-between mb-6">
-                        <div className="flex items-center gap-2">
-                          <span className="px-3 py-1 bg-indigo-100 text-indigo-700 rounded-full text-xs font-bold uppercase tracking-wider">
-                            {activeChapter.quiz.length} Questions
-                          </span>
-                          <span className="text-slate-400 text-sm">•</span>
-                          <span className="text-slate-500 text-sm italic">AI Generated</span>
-                        </div>
-                        <button
-                          onClick={() => generateQuiz()}
-                          disabled={isGeneratingQuiz}
-                          className="text-sm text-indigo-600 font-semibold hover:text-indigo-700 flex items-center gap-1 disabled:opacity-50"
-                        >
-                          {isGeneratingQuiz ? (
-                            <Loader2 size={14} className="animate-spin" />
-                          ) : (
-                            <RotateCcw size={14} />
-                          )}
-                          {isGeneratingQuiz ? 'Regenerating...' : 'Regenerate'}
-                        </button>
-                      </div>
-                      <QuizViewer questions={activeChapter.quiz} isTeacherView={true} />
-                    </div>
-                  )}
-
-                  {/* Custom Confirmation Modal */}
-                  <AnimatePresence>
-                    {showRegenConfirm && (
-                      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
-                        <motion.div 
-                          initial={{ opacity: 0, scale: 0.95 }}
-                          animate={{ opacity: 1, scale: 1 }}
-                          exit={{ opacity: 0, scale: 0.95 }}
-                          className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl border border-slate-200 dark:border-slate-700 p-8 max-w-md w-full"
-                        >
-                          <div className="bg-amber-50 dark:bg-amber-900/30 w-12 h-12 rounded-full flex items-center justify-center mb-4">
-                            <RotateCcw className="text-amber-600 dark:text-amber-400 w-6 h-6" />
-                          </div>
-                          <h3 className="text-xl font-bold text-slate-800 dark:text-slate-200 mb-2">Regenerate Quiz?</h3>
-                          <p className="text-slate-600 dark:text-slate-400 mb-6">
-                            Regenerating the quiz will <span className="font-bold text-red-600 dark:text-red-400">delete all current student submissions</span> and scores for this chapter. This action cannot be undone.
-                          </p>
-                          <div className="flex gap-3">
-                            <button
-                              onClick={() => generateQuiz(true)}
-                              className="flex-1 bg-indigo-600 text-white py-3 rounded-xl font-bold hover:bg-indigo-700 transition-all"
-                            >
-                              Yes, Regenerate
-                            </button>
-                            <button
-                              onClick={() => setShowRegenConfirm(false)}
-                              className="flex-1 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 py-3 rounded-xl font-bold hover:bg-slate-200 dark:hover:bg-slate-600 transition-all"
-                            >
-                              Cancel
-                            </button>
-                          </div>
-                        </motion.div>
-                      </div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              )}
-
-              {activeTab === 'analytics' && (
-                <div className="space-y-8">
-                  {isLoadingSubmissions ? (
-                    <div className="flex flex-col items-center justify-center py-20 text-slate-400">
-                      <Loader2 className="w-8 h-8 animate-spin mb-4" />
-                      <p>Loading analytics data...</p>
-                    </div>
-                  ) : !analytics ? (
-                    <div className="text-center py-20 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
-                      <div className="bg-white dark:bg-slate-800 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 shadow-sm">
-                        <BarChart3 className="w-8 h-8 text-slate-300 dark:text-slate-600" />
-                      </div>
-                      <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">No Submissions Yet</h3>
-                      <p className="text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
-                        Once students complete the quiz for this chapter, you'll see their performance metrics here.
-                      </p>
-                    </div>
-                  ) : (
-                    <>
-                      {/* Metric Cards */}
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
-                          <p className="text-slate-500 dark:text-slate-400 text-sm font-medium mb-1 uppercase tracking-wider">Total Completions</p>
-                          <div className="flex items-end gap-2">
-                            <span className="text-4xl font-black text-slate-800 dark:text-slate-200">{analytics.totalCompletions}</span>
-                            <span className="text-slate-400 dark:text-slate-500 text-sm mb-1">attempts</span>
-                          </div>
-                        </div>
-                        <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
-                          <p className="text-slate-500 dark:text-slate-400 text-sm font-medium mb-1 uppercase tracking-wider">Average Score</p>
-                          <div className="flex items-end gap-2">
-                            <span className="text-4xl font-black text-indigo-600 dark:text-indigo-400">{analytics.avgScore}</span>
-                            <span className="text-slate-400 dark:text-slate-500 text-sm mb-1">/ {activeChapter.quiz.length}</span>
-                          </div>
-                        </div>
-                        <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
-                          <p className="text-slate-500 dark:text-slate-400 text-sm font-medium mb-1 uppercase tracking-wider">Unique Students</p>
-                          <div className="flex items-end gap-2">
-                            <span className="text-4xl font-black text-emerald-600 dark:text-emerald-400">{analytics.totalStudents}</span>
-                            <span className="text-slate-400 dark:text-slate-500 text-sm mb-1">enrolled</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Low Accuracy Questions */}
-                      <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm overflow-hidden">
-                        <div className="p-6 border-b border-slate-50 dark:border-slate-700/50 flex items-center justify-between bg-slate-50/50 dark:bg-slate-900/50">
-                          <h3 className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2">
-                            <AlertCircle className="w-5 h-5 text-amber-500 dark:text-amber-400" />
-                            Question Performance
-                          </h3>
-                          <span className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Accuracy Rate</span>
-                        </div>
-                        <div className="divide-y divide-slate-50 dark:divide-slate-700/50">
-                          {analytics.questionStats.map((stat: any, idx: number) => (
-                            <div key={idx} className="p-6 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
-                              <div className="flex gap-4 items-start max-w-[70%]">
-                                <span className="w-6 h-6 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 flex items-center justify-center text-xs font-bold flex-shrink-0">
-                                  {idx + 1}
-                                </span>
-                                <p className="text-slate-700 dark:text-slate-300 font-medium line-clamp-2">{stat.question}</p>
-                              </div>
-                              <div className="flex items-center gap-4">
-                                <div className="w-32 h-2 bg-slate-100 dark:bg-slate-700 rounded-full overflow-hidden hidden sm:block">
-                                  <div 
-                                    className={`h-full transition-all duration-500 ${
-                                      stat.isLowAccuracy ? 'bg-red-500' : 'bg-emerald-500'
-                                    }`} 
-                                    style={{ width: `${stat.accuracy}%` }}
-                                  ></div>
-                                </div>
-                                <span className={`font-black text-lg w-16 text-right ${
-                                  stat.isLowAccuracy ? 'text-red-500 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'
-                                }`}>
-                                  {stat.accuracy}%
-                                </span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-
-                      {/* Recent Submissions Table */}
-                      <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm overflow-hidden">
-                        <div className="p-6 border-b border-slate-50 dark:border-slate-700/50 bg-slate-50/50 dark:bg-slate-900/50">
-                          <h3 className="font-bold text-slate-800 dark:text-slate-200">Recent Submissions</h3>
-                        </div>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-left">
-                            <thead>
-                              <tr className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest border-b border-slate-50 dark:border-slate-700/50">
-                                <th className="px-6 py-4">Student</th>
-                                <th className="px-6 py-4">Score</th>
-                                <th className="px-6 py-4">Date</th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-50 dark:divide-slate-700/50">
-                              {submissions.slice(0, 5).map((sub) => (
-                                <tr key={sub.id} className="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
-                                  <td className="px-6 py-4 font-semibold text-slate-700 dark:text-slate-300">{sub.student_name}</td>
-                                  <td className="px-6 py-4">
-                                    <span className={`px-3 py-1 rounded-full text-xs font-bold ${
-                                      sub.score >= activeChapter.quiz.length / 2 ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400' : 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
-                                    }`}>
-                                      {sub.score} / {activeChapter.quiz.length}
-                                    </span>
-                                  </td>
-                                  <td className="px-6 py-4 text-slate-500 dark:text-slate-400 text-sm">
-                                    {new Date(sub.created_at).toLocaleDateString()}
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    </>
-                  )}
-                </div>
               )}
             </div>
-          </>
+
+            <div className={`flex items-center gap-4 mb-6 ${!isLeftSidebarOpen ? 'ml-12' : ''}`}>
+              <div className="flex-1 flex items-center gap-2">
+                <FileText className="text-indigo-500 flex-shrink-0" />
+                {isEditingChapterTitle ? (
+                  <div className="flex items-center gap-2 flex-1">
+                    <input
+                      type="text"
+                      autoFocus
+                      value={editedChapterTitle}
+                      onChange={(e) => setEditedChapterTitle(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleUpdateChapterTitle()}
+                      className="flex-1 text-2xl font-semibold bg-slate-50 dark:bg-slate-900 border-b-2 border-indigo-500 outline-none px-1 text-slate-800 dark:text-white"
+                    />
+                    <button
+                      onClick={handleUpdateChapterTitle}
+                      className="p-1.5 bg-emerald-100 text-emerald-700 rounded-lg hover:bg-emerald-200"
+                    >
+                      <Check size={20} />
+                    </button>
+                    <button
+                      onClick={() => setIsEditingChapterTitle(false)}
+                      className="p-1.5 bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200"
+                    >
+                      <X size={20} />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3 group flex-wrap">
+                    <h2 className="text-2xl font-semibold text-slate-800 dark:text-white">{activeChapter.title}</h2>
+                    {renderStatusBadge(activeChapter)}
+                    <button
+                      onClick={() => {
+                        setEditedChapterTitle(activeChapter.title);
+                        setIsEditingChapterTitle(true);
+                      }}
+                      className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg opacity-0 group-hover:opacity-100 transition-all"
+                      title="Rename Chapter"
+                    >
+                      <Edit2 size={16} />
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex border-b border-slate-200 dark:border-slate-700 mb-8 overflow-x-auto">
+              <button
+                onClick={() => setActiveTab('material')}
+                className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
+                  activeTab === 'material'
+                    ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400'
+                    : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
+                }`}
+              >
+                Course Material
+              </button>
+              <button
+                onClick={() => setActiveTab('reading')}
+                className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
+                  activeTab === 'reading'
+                    ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400'
+                    : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
+                }`}
+              >
+                Relevant Reading
+              </button>
+              <button
+                onClick={() => setActiveTab('quiz')}
+                className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
+                  activeTab === 'quiz'
+                    ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400'
+                    : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
+                }`}
+              >
+                Chapter Quiz
+              </button>
+              <button
+                onClick={() => setActiveTab('analytics')}
+                className={`px-6 py-3 font-medium text-sm transition-all border-b-2 whitespace-nowrap ${
+                  activeTab === 'analytics'
+                    ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 dark:border-indigo-400'
+                    : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'
+                }`}
+              >
+                Analytics
+              </button>
+            </div>
+
+            {activeTab === 'material' && (
+              <div className="space-y-8">
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  className="hidden"
+                  accept="application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                  onChange={handleFileUpload}
+                />
+
+                {!activeChapter.ppt?.supabaseUrl ? (
+                  <div
+                    className="border-2 border-dashed border-slate-300 dark:border-slate-600 rounded-xl p-12 text-center hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors cursor-pointer"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    {isUploading ? (
+                      <div className="flex flex-col items-center gap-4">
+                        <Loader2 className="w-10 h-10 text-indigo-500 animate-spin" />
+                        <p className="text-slate-600 dark:text-slate-300 font-medium">
+                          Uploading document... {uploadProgress}%
+                        </p>
+                        <div className="w-64 h-2 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-indigo-500 transition-all duration-300"
+                            style={{ width: `${uploadProgress}%` }}
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center gap-4">
+                        <div className="bg-indigo-50 dark:bg-indigo-900/30 p-4 rounded-full">
+                          <UploadCloud className="w-8 h-8 text-indigo-600 dark:text-indigo-400" />
+                        </div>
+                        <div>
+                          <p className="text-lg font-medium text-slate-700 dark:text-slate-300">
+                            Upload Teaching Material (PDF or PPT)
+                          </p>
+                          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+                            After upload, extraction + reading + quiz generation will run automatically.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    {renderProcessingPanel(activeChapter)}
+
+                    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm">
+                      <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 flex items-center justify-between">
+                        <div>
+                          <h3 className="font-semibold text-slate-800 dark:text-slate-200">Document Preview</h3>
+                          <p className="text-sm text-slate-500 dark:text-slate-400">
+                            {activeChapter.ppt?.originalName || 'Uploaded file'}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => fileInputRef.current?.click()}
+                          className="px-4 py-2 bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl font-medium hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors"
+                        >
+                          Replace File
+                        </button>
+                      </div>
+
+                      <div className="h-[70vh] bg-slate-50 dark:bg-slate-900/50">
+                        {renderDocument(activeChapter)}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'reading' && renderReadingTab()}
+
+            {activeTab === 'quiz' && renderQuizTab()}
+
+            {activeTab === 'analytics' && (
+              <div className="space-y-8">
+                {isLoadingSubmissions ? (
+                  <div className="flex flex-col items-center justify-center py-20 text-slate-400">
+                    <Loader2 className="w-8 h-8 animate-spin mb-4" />
+                    <p>Loading analytics data...</p>
+                  </div>
+                ) : !analytics ? (
+                  <div className="text-center py-20 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700">
+                    <div className="bg-white dark:bg-slate-800 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 shadow-sm">
+                      <BarChart3 className="w-8 h-8 text-slate-300 dark:text-slate-600" />
+                    </div>
+                    <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2">No Submissions Yet</h3>
+                    <p className="text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
+                      Once students complete the quiz for this chapter, you&apos;ll see their performance metrics here.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                      <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
+                        <p className="text-slate-500 dark:text-slate-400 text-sm font-medium mb-1 uppercase tracking-wider">
+                          Total Completions
+                        </p>
+                        <div className="flex items-end gap-2">
+                          <span className="text-4xl font-black text-slate-800 dark:text-slate-200">
+                            {analytics.totalCompletions}
+                          </span>
+                          <span className="text-slate-400 dark:text-slate-500 text-sm mb-1">attempts</span>
+                        </div>
+                      </div>
+
+                      <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
+                        <p className="text-slate-500 dark:text-slate-400 text-sm font-medium mb-1 uppercase tracking-wider">
+                          Average Score
+                        </p>
+                        <div className="flex items-end gap-2">
+                          <span className="text-4xl font-black text-indigo-600 dark:text-indigo-400">
+                            {analytics.avgScore}
+                          </span>
+                          <span className="text-slate-400 dark:text-slate-500 text-sm mb-1">
+                            / {activeChapter.quiz.length}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
+                        <p className="text-slate-500 dark:text-slate-400 text-sm font-medium mb-1 uppercase tracking-wider">
+                          Unique Students
+                        </p>
+                        <div className="flex items-end gap-2">
+                          <span className="text-4xl font-black text-emerald-600 dark:text-emerald-400">
+                            {analytics.totalStudents}
+                          </span>
+                          <span className="text-slate-400 dark:text-slate-500 text-sm mb-1">enrolled</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm overflow-hidden">
+                      <div className="p-6 border-b border-slate-50 dark:border-slate-700/50 flex items-center justify-between bg-slate-50/50 dark:bg-slate-900/50">
+                        <h3 className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+                          <AlertCircle className="w-5 h-5 text-amber-500 dark:text-amber-400" />
+                          Question Performance
+                        </h3>
+                        <span className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">
+                          Accuracy Rate
+                        </span>
+                      </div>
+
+                      <div className="divide-y divide-slate-50 dark:divide-slate-700/50">
+                        {analytics.questionStats.map((stat: any, idx: number) => (
+                          <div
+                            key={idx}
+                            className="p-6 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors"
+                          >
+                            <div className="flex gap-4 items-start max-w-[70%]">
+                              <span className="w-6 h-6 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 flex items-center justify-center text-xs font-bold flex-shrink-0">
+                                {idx + 1}
+                              </span>
+                              <p className="text-slate-700 dark:text-slate-300 font-medium line-clamp-2">
+                                {stat.question}
+                              </p>
+                            </div>
+
+                            <div className="flex items-center gap-4">
+                              <div className="w-32 h-2 bg-slate-100 dark:bg-slate-700 rounded-full overflow-hidden hidden sm:block">
+                                <div
+                                  className={`h-full transition-all duration-500 ${
+                                    stat.isLowAccuracy ? 'bg-red-500' : 'bg-emerald-500'
+                                  }`}
+                                  style={{ width: `${stat.accuracy}%` }}
+                                />
+                              </div>
+                              <span
+                                className={`font-black text-lg w-16 text-right ${
+                                  stat.isLowAccuracy
+                                    ? 'text-red-500 dark:text-red-400'
+                                    : 'text-emerald-600 dark:text-emerald-400'
+                                }`}
+                              >
+                                {stat.accuracy}%
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm overflow-hidden">
+                      <div className="p-6 border-b border-slate-50 dark:border-slate-700/50 bg-slate-50/50 dark:bg-slate-900/50">
+                        <h3 className="font-bold text-slate-800 dark:text-slate-200">Recent Submissions</h3>
+                      </div>
+
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                          <thead>
+                            <tr className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest border-b border-slate-50 dark:border-slate-700/50">
+                              <th className="px-6 py-4">Student</th>
+                              <th className="px-6 py-4">Score</th>
+                              <th className="px-6 py-4">Date</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50 dark:divide-slate-700/50">
+                            {submissions.slice(0, 5).map((sub) => (
+                              <tr key={sub.id} className="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
+                                <td className="px-6 py-4 font-semibold text-slate-700 dark:text-slate-300">
+                                  {sub.student_name}
+                                </td>
+                                <td className="px-6 py-4">
+                                  <span
+                                    className={`px-3 py-1 rounded-full text-xs font-bold ${
+                                      sub.score >= activeChapter.quiz.length / 2
+                                        ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
+                                        : 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+                                    }`}
+                                  >
+                                    {sub.score} / {activeChapter.quiz.length}
+                                  </span>
+                                </td>
+                                <td className="px-6 py-4 text-slate-500 dark:text-slate-400 text-sm">
+                                  {new Date(sub.created_at).toLocaleDateString()}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
         )}
       </div>
     </div>
