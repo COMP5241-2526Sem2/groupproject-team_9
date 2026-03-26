@@ -20,6 +20,7 @@ import {
   Eye,
   EyeOff,
   Clock3,
+  Presentation,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import QuizViewer from './QuizViewer';
@@ -200,6 +201,11 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
   const [editingReading, setEditingReading] = useState('');
   const [isEditingReading, setIsEditingReading] = useState(false);
 
+  const [pageNumberInput, setPageNumberInput] = useState('1');
+  const [pageSummary, setPageSummary] = useState<string | null>(null);
+  const [pageSummaryError, setPageSummaryError] = useState<string | null>(null);
+  const [isPageSummaryLoading, setIsPageSummaryLoading] = useState(false);
+
   const activeChapter = useMemo(
     () => chapters.find((c) => c.id === activeChapterId) || null,
     [chapters, activeChapterId]
@@ -285,6 +291,12 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
 
     return () => clearInterval(interval);
   }, [activeChapter, activeTab, activeChapterId]);
+
+  useEffect(() => {
+    setPageSummary(null);
+    setPageSummaryError(null);
+    setPageNumberInput('1');
+  }, [activeChapterId]);
 
   const fetchChapters = async () => {
     const { data, error } = await supabase
@@ -467,6 +479,77 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
       alert(error?.message || 'Processing request did not complete normally. Please check again in a moment.');
     } finally {
       processingTriggerRef.current[chapter.id] = false;
+    }
+  };
+
+  const handleGeneratePageSummary = async () => {
+    if (!activeChapter) return;
+
+    const pageNumber = Number(pageNumberInput);
+    if (!Number.isFinite(pageNumber) || pageNumber < 1) {
+      setPageSummary(null);
+      setPageSummaryError('请输入有效的页码（1或更高）。');
+      return;
+    }
+
+    if (activeChapterStatus !== 'ready') {
+      setPageSummary(null);
+      setPageSummaryError(
+        activeChapterStatus === 'failed'
+          ? '此章节处理失败，无法生成总结。'
+          : '此章节正在处理中。请稍后再试。'
+      );
+      return;
+    }
+
+    if (!activeChapter.ppt?.originalName?.toLowerCase().endsWith('.pptx')) {
+      setPageSummary(null);
+      setPageSummaryError('仅支持PPTX格式的PPT文件。');
+      return;
+    }
+
+    setIsPageSummaryLoading(true);
+    setPageSummary(null);
+    setPageSummaryError(null);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
+
+    try {
+      const response = await fetch(
+        `/api/chapters/${encodeURIComponent(activeChapter.id)}/page-summary`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pageNumber: Math.floor(pageNumber) }),
+          signal: controller.signal,
+        }
+      );
+
+      const text = await response.text();
+      let result: any = null;
+
+      try {
+        result = JSON.parse(text);
+      } catch {
+        throw new Error(`API返回了无效的JSON：${text.slice(0, 200)}`);
+      }
+
+      if (!response.ok || !result?.ok) {
+        throw new Error(result?.error || '生成总结失败。');
+      }
+
+      setPageSummary(result.summary || '未生成总结。');
+    } catch (error: any) {
+      console.error('页面总结错误：', error);
+      const errorMessage =
+        error?.name === 'AbortError'
+          ? '请求超时。请重试。'
+          : error?.message || '生成总结时发生错误。';
+      setPageSummaryError(errorMessage);
+    } finally {
+      clearTimeout(timeoutId);
+      setIsPageSummaryLoading(false);
     }
   };
 
@@ -1294,6 +1377,67 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
                       <div className="h-[70vh] bg-slate-50 dark:bg-slate-900/50">
                         {renderDocument(activeChapter)}
                       </div>
+                    </div>
+
+                    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm p-6">
+                      <div className="flex items-center gap-3 mb-4">
+                        <Presentation className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+                        <h3 className="font-semibold text-slate-800 dark:text-slate-200">
+                          页面总结预览
+                        </h3>
+                      </div>
+                      <p className="text-sm text-slate-600 dark:text-slate-400 mb-4">
+                        输入PPT页码，生成该页内容的AI总结
+                      </p>
+
+                      <div className="flex items-center gap-3 mb-4">
+                        <input
+                          type="number"
+                          min={1}
+                          value={pageNumberInput}
+                          onChange={(e) => setPageNumberInput(e.target.value)}
+                          className="w-24 px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                          disabled={isPageSummaryLoading || activeChapterStatus !== 'ready'}
+                          placeholder="页码"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleGeneratePageSummary}
+                          disabled={isPageSummaryLoading || activeChapterStatus !== 'ready'}
+                          className="px-4 py-2 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {isPageSummaryLoading ? '生成中...' : '生成总结'}
+                        </button>
+                      </div>
+
+                      {isPageSummaryLoading && (
+                        <div className="flex items-center gap-2 text-sm text-indigo-600 dark:text-indigo-400 mb-4">
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>正在生成总结...</span>
+                        </div>
+                      )}
+
+                      {pageSummaryError && (
+                        <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800/30 rounded-lg p-3 mb-4">
+                          {pageSummaryError}
+                        </div>
+                      )}
+
+                      {pageSummary && !pageSummaryError && (
+                        <div className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800/30 rounded-lg p-4">
+                          <div className="prose prose-sm max-w-none dark:prose-invert prose-indigo">
+                            <Markdown>{pageSummary}</Markdown>
+                          </div>
+                        </div>
+                      )}
+
+                      {activeChapterStatus !== 'ready' && (
+                        <div className="text-sm text-slate-500 dark:text-slate-400">
+                          {activeChapterStatus === 'failed'
+                            ? '此章节处理失败，无法生成页面总结。'
+                            : `此章节正在处理中（${activeChapterStageLabel}，${activeChapterProgress}%）。处理完成后即可生成页面总结。`}
+                        </div>
+                      )}
                     </div>
                   </>
                 )}

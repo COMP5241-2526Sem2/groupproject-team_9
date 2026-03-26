@@ -1,3 +1,4 @@
+import JSZip from 'jszip';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 export const config = {
@@ -39,6 +40,8 @@ type ProcessPayload = {
   fileName?: string;
   mimeType?: string;
 };
+
+const STORAGE_BUCKET = 'course-materials';
 
 type GeminiCallOptions = {
   model?: string;
@@ -261,16 +264,18 @@ async function processChapterMaterial(
   });
 
   const extractedText = await extractTextFromFileWithGemini({
+    supabase,
     fileUrl,
     fileName,
     mimeType,
+    storagePath: chapter.ppt?.storagePath,
   });
 
   const normalizedText = normalizeExtractedText(extractedText);
 
   if (!normalizedText || normalizedText.length < 80) {
     throw new Error(
-      'Gemini document parsing returned too little content. Please try another file or verify that the uploaded document is readable.'
+      'Document parsing returned too little content. Please try another file or verify that the uploaded document is readable.'
     );
   }
 
@@ -399,17 +404,38 @@ async function failChapter(
 }
 
 async function extractTextFromFileWithGemini(args: {
+  supabase: SupabaseClient;
   fileUrl: string;
   fileName: string;
   mimeType?: string;
+  storagePath?: string | null;
 }): Promise<string> {
-  const { fileUrl, fileName, mimeType = '' } = args;
+  const { supabase, fileUrl, fileName, mimeType = '', storagePath } = args;
 
   if (!isHttpUrl(fileUrl)) {
     throw new Error('fileUrl must be a public http(s) URL.');
   }
 
   const resolvedMimeType = normalizeMimeType(fileName, mimeType);
+
+  if (isPptxFile(fileName, resolvedMimeType) || isPptFile(fileName, resolvedMimeType)) {
+    if (!storagePath) {
+      throw new Error('Missing storage path for the uploaded PPT/PPTX file.');
+    }
+
+    if (isPptFile(fileName, resolvedMimeType)) {
+      throw new Error('Legacy PPT files are not supported for text extraction. Please upload PPTX.');
+    }
+
+    const pptxText = await extractPptxTextFromStorage(supabase, storagePath);
+    const normalized = normalizeExtractedText(pptxText);
+
+    if (!normalized) {
+      throw new Error('PPTX text extraction returned empty content.');
+    }
+
+    return normalized;
+  }
   const prompt = buildDocExtractionPrompt({
     fileName,
     mimeType: resolvedMimeType,
@@ -432,6 +458,95 @@ async function extractTextFromFileWithGemini(args: {
   console.log('[gemini-doc] extracted length:', normalized.length);
 
   return normalized;
+}
+
+function isPptxFile(fileName: string, mimeType: string) {
+  const lower = fileName.toLowerCase();
+  return (
+    mimeType ===
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+    lower.endsWith('.pptx')
+  );
+}
+
+function isPptFile(fileName: string, mimeType: string) {
+  const lower = fileName.toLowerCase();
+  return mimeType === 'application/vnd.ms-powerpoint' || lower.endsWith('.ppt');
+}
+
+function decodeXmlEntities(text: string) {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) =>
+      String.fromCharCode(parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_m, num) =>
+      String.fromCharCode(parseInt(num, 10))
+    );
+}
+
+function extractTextFromSlideXml(xml: string) {
+  const matches = [...xml.matchAll(/<a:t[^>]*>(.*?)<\/a:t>/g)];
+  const raw = matches.map((m) => decodeXmlEntities(m[1] || '')).join(' ');
+  return raw.replace(/\s+/g, ' ').trim();
+}
+
+async function extractPptxTextFromStorage(
+  supabase: SupabaseClient,
+  storagePath: string
+) {
+  const { data, error } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .download(storagePath);
+
+  if (error || !data) {
+    console.error('[pptx-extract] storage download error:', error);
+    throw new Error('Failed to download PPTX from storage.');
+  }
+
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(await data.arrayBuffer());
+  } catch (err) {
+    console.error('[pptx-extract] zip parse error:', err);
+    throw new Error('Failed to parse PPTX file.');
+  }
+
+  const slideFiles = zip.file(/ppt\/slides\/slide\d+\.xml$/) || [];
+
+  if (slideFiles.length === 0) {
+    throw new Error('No slides were found in the PPTX file.');
+  }
+
+  const slides = slideFiles
+    .map((file) => {
+      const match = file.name.match(/slide(\d+)\.xml$/);
+      return { index: match ? Number(match[1]) : Number.MAX_SAFE_INTEGER, name: file.name };
+    })
+    .sort((a, b) => a.index - b.index);
+
+  const slideTexts: string[] = [];
+
+  for (let i = 0; i < slides.length; i += 1) {
+    const slideFile = zip.file(slides[i].name);
+    if (!slideFile) continue;
+
+    const xml = await slideFile.async('string');
+    const text = extractTextFromSlideXml(xml);
+    if (!text) continue;
+
+    slideTexts.push(`Slide ${i + 1}: ${text}`);
+  }
+
+  if (slideTexts.length === 0) {
+    throw new Error('No readable text was found in the PPTX slides.');
+  }
+
+  return slideTexts.join('\n\n');
 }
 
 function buildDocExtractionPrompt(args: {
