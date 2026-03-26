@@ -4,6 +4,8 @@ export const config = {
   runtime: 'nodejs',
 };
 
+const NO_READABLE_TEXT_PLACEHOLDER = '[No readable text extracted for this page.]';
+
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -42,6 +44,17 @@ type ProcessPayload = {
 
 type QwenDocParsingStrategy = 'auto' | 'text_only' | 'text_and_images';
 
+type PageSection = {
+  page: number;
+  content: string;
+};
+
+type PageValidationResult = {
+  ok: boolean;
+  reason?: string;
+  pageCount: number;
+};
+
 function getSupabaseAdmin(): SupabaseClient {
   const supabaseUrl =
     process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL;
@@ -56,6 +69,24 @@ function getSupabaseAdmin(): SupabaseClient {
   return createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+}
+
+function getGeminiConfig() {
+  const apiKey = process.env.GEMINI_API_KEY || '';
+
+  if (!apiKey) {
+    throw new Error('Missing GEMINI_API_KEY.');
+  }
+
+  return {
+    apiKey,
+    baseUrl:
+      process.env.GEMINI_BASE_URL?.replace(/\/$/, '') ||
+      'https://generativelanguage.googleapis.com/v1beta',
+    pdfModel: process.env.GEMINI_PDF_MODEL || 'gemini-2.5-flash',
+    thinkingBudget: envInt('GEMINI_THINKING_BUDGET', 1024, -1, 24576),
+    maxOutputTokens: envInt('GEMINI_PDF_MAX_OUTPUT_TOKENS', 16384, 1024, 65536),
+  };
 }
 
 function getQwenDocConfig() {
@@ -102,6 +133,15 @@ function getQwenChatConfig() {
   };
 }
 
+function envInt(name: string, fallback: number, min?: number, max?: number) {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  let value = Math.floor(raw);
+  if (typeof min === 'number') value = Math.max(min, value);
+  if (typeof max === 'number') value = Math.min(max, value);
+  return value;
+}
+
 function truncate(text: string, maxLen = 1200) {
   if (!text) return '';
   return text.length > maxLen ? `${text.slice(0, maxLen)}...(truncated)` : text;
@@ -125,6 +165,10 @@ function normalizeMimeType(fileName: string, mimeType = '') {
   return 'application/octet-stream';
 }
 
+function isPdfFile(fileName: string, mimeType = '') {
+  return normalizeMimeType(fileName, mimeType) === 'application/pdf';
+}
+
 async function fetchWithTimeout(
   input: RequestInfo | URL,
   init: RequestInit = {},
@@ -141,6 +185,38 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timer);
   }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetries<T>(
+  fn: () => Promise<T>,
+  options?: {
+    retries?: number;
+    baseDelayMs?: number;
+  }
+): Promise<T> {
+  const retries = options?.retries ?? 2;
+  const baseDelayMs = options?.baseDelayMs ?? 800;
+
+  let lastErr: unknown;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= retries) break;
+
+      const delay =
+        baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
+      await sleep(delay);
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error('Retry failed.');
 }
 
 export default async function handler(req: Request) {
@@ -241,6 +317,8 @@ async function processChapterMaterial(
     throw new Error('Chapter not found.');
   }
 
+  const resolvedMimeType = normalizeMimeType(fileName, mimeType);
+
   await updateChapterProgress(supabase, chapterId, {
     content_status: 'processing',
     processing_stage: 'extracting_text',
@@ -248,30 +326,62 @@ async function processChapterMaterial(
     processing_error: null,
   });
 
-  const extractedText = await extractTextFromFileWithQwen({
-    fileUrl,
-    fileName,
-    mimeType,
-  });
+  let pageNumberedText = '';
+  let overallContextText = '';
 
-  const normalizedText = normalizeExtractedText(extractedText);
+  if (isPdfFile(fileName, resolvedMimeType)) {
+    const pdfBytes = await downloadBinaryFile(fileUrl);
 
-  if (!normalizedText || normalizedText.length < 80) {
+    const extracted = await extractPdfWithGeminiPageMarkers({
+      pdfBytes,
+      fileName,
+    });
+
+    pageNumberedText = extracted.pageNumberedText;
+    overallContextText = extracted.plainText;
+  } else {
+    const wholeDocText = await extractTextFromNonPdfWithQwen({
+      fileUrl,
+      fileName,
+      mimeType: resolvedMimeType,
+    });
+
+    const normalizedWholeDocText = normalizeExtractedText(wholeDocText);
+    pageNumberedText = addPageNumbersToExtractedText(normalizedWholeDocText);
+    overallContextText = stripPageLabelsFromExtractedText(pageNumberedText);
+  }
+
+  const pageValidation = validatePageNumberedText(pageNumberedText);
+
+  if (!pageValidation.ok) {
     throw new Error(
-      'Qwen document parsing returned too little content. Please try another file or verify that the uploaded document is readable.'
+      `Page-aware extraction failed validation: ${pageValidation.reason || 'unknown reason'}`
     );
   }
 
+  if (!pageNumberedText || pageNumberedText.length < 80) {
+    throw new Error(
+      'Document parsing returned too little content. Please try another file or verify that the uploaded document is readable.'
+    );
+  }
+
+  if (!overallContextText || overallContextText.length < 80) {
+    overallContextText = stripPageLabelsFromExtractedText(pageNumberedText);
+  }
+
   await updateChapterProgress(supabase, chapterId, {
-    extracted_text: normalizedText,
+    extracted_text: pageNumberedText,
     content_status: 'processing',
     processing_stage: 'chunking',
     processing_progress: 45,
     processing_error: null,
   });
 
-  const chunks = chunkText(normalizedText, 1800, 200);
+  const chunks = chunkText(overallContextText, 1800, 200);
   const condensedContext = buildCondensedContext(chunks);
+
+  const pages = extractPagesFromText(pageNumberedText);
+  const pageAwareContext = buildPageAwareContext(pages);
 
   await updateChapterProgress(supabase, chapterId, {
     content_status: 'processing',
@@ -283,6 +393,7 @@ async function processChapterMaterial(
   const reading = await generateRelevantReading({
     chapterTitle: chapter.title,
     context: condensedContext,
+    pageAwareContext,
   });
 
   await updateChapterProgress(supabase, chapterId, {
@@ -386,7 +497,175 @@ async function failChapter(
   }
 }
 
-async function extractTextFromFileWithQwen(args: {
+async function extractPdfWithGeminiPageMarkers(args: {
+  pdfBytes: Uint8Array;
+  fileName: string;
+}): Promise<{ pageNumberedText: string; plainText: string }> {
+  const { pdfBytes, fileName } = args;
+  const { pdfModel, thinkingBudget, maxOutputTokens } = getGeminiConfig();
+
+  const prompt = buildGeminiPdfPageAwarePrompt({ fileName });
+
+  const raw = await withRetries(
+    () =>
+      callGeminiPdfInlineText({
+        model: pdfModel,
+        prompt,
+        pdfBytes,
+        thinkingBudget,
+        maxOutputTokens,
+        timeoutMs: 180000,
+      }),
+    { retries: 2, baseDelayMs: 1200 }
+  );
+
+  const normalized = normalizeExtractedText(raw);
+  const pageNumberedText = addPageNumbersToExtractedText(normalized);
+  const plainText = stripPageLabelsFromExtractedText(pageNumberedText);
+
+  console.log('[gemini-pdf-pageaware] model=', pdfModel, 'len=', normalized.length);
+
+  return {
+    pageNumberedText,
+    plainText,
+  };
+}
+
+function buildGeminiPdfPageAwarePrompt(args: { fileName: string }) {
+  const { fileName } = args;
+
+  return `
+You are extracting the full readable teaching content from a course PDF.
+
+Goal:
+Return the PDF content in clean Markdown, while preserving page boundaries explicitly.
+
+This is critical:
+- Start EACH page with an exact standalone marker in this format:
+  [[PAGE_1]]
+  [[PAGE_2]]
+  [[PAGE_3]]
+  ...
+- Use one marker for every page in order.
+- Do NOT skip page numbers.
+- Do NOT merge multiple pages into one page marker.
+- If a page has little readable text, still include its page marker and any readable title, labels, or notes from that page.
+
+Strict requirements:
+1. Do NOT summarize.
+2. Do NOT explain.
+3. Do NOT answer questions about the file.
+4. Preserve as much original content as possible.
+5. Keep headings, bullet points, numbered lists, formulas, equations, captions, and emphasized terms.
+6. If a table exists, convert it into a readable Markdown table when possible; otherwise convert it into clearly labeled rows and columns.
+7. If a figure, diagram, chart, or image contains meaningful educational information, preserve that information as concise descriptive notes near the relevant section.
+8. Preserve the reading order within each page as much as possible.
+9. Ignore clearly unreadable fragments instead of hallucinating.
+10. Output Markdown only.
+11. Do not wrap the whole output in triple backticks.
+12. Do not add any introduction or conclusion outside the page markers.
+
+PDF file name: ${fileName}
+`.trim();
+}
+
+async function callGeminiPdfInlineText(args: {
+  model: string;
+  prompt: string;
+  pdfBytes: Uint8Array;
+  thinkingBudget: number;
+  maxOutputTokens: number;
+  timeoutMs?: number;
+}): Promise<string> {
+  const {
+    model,
+    prompt,
+    pdfBytes,
+    thinkingBudget,
+    maxOutputTokens,
+    timeoutMs = 180000,
+  } = args;
+
+  const { apiKey, baseUrl } = getGeminiConfig();
+  const endpoint = `${baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const body = {
+    contents: [
+      {
+        parts: [
+          { text: prompt },
+          {
+            inlineData: {
+              mimeType: 'application/pdf',
+              data: Buffer.from(pdfBytes).toString('base64'),
+            },
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens,
+      thinkingConfig: {
+        thinkingBudget,
+      },
+    },
+  };
+
+  const res = await fetchWithTimeout(
+    endpoint,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    },
+    timeoutMs
+  );
+
+  const raw = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`Gemini request failed: ${res.status} ${truncate(raw)}`);
+  }
+
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Gemini returned non-JSON response: ${truncate(raw)}`);
+  }
+
+  const text = extractGeminiText(data);
+
+  if (!text) {
+    throw new Error(`Gemini returned empty content. raw=${truncate(raw)}`);
+  }
+
+  return text;
+}
+
+function extractGeminiText(data: any): string {
+  const parts = data?.candidates?.[0]?.content?.parts;
+
+  if (Array.isArray(parts)) {
+    const text = parts
+      .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
+      .join('\n')
+      .trim();
+
+    if (text) return text;
+  }
+
+  if (typeof data?.text === 'string' && data.text.trim()) {
+    return data.text.trim();
+  }
+
+  return '';
+}
+
+async function extractTextFromNonPdfWithQwen(args: {
   fileUrl: string;
   fileName: string;
   mimeType?: string;
@@ -398,19 +677,12 @@ async function extractTextFromFileWithQwen(args: {
   }
 
   const resolvedMimeType = normalizeMimeType(fileName, mimeType);
-  const prompt = buildDocExtractionPrompt({
+  const prompt = buildWholeDocExtractionPrompt({
     fileName,
     mimeType: resolvedMimeType,
-  });
-
-  console.log('[qwen-doc] request', {
-    fileName,
-    mimeType: resolvedMimeType,
-    fileUrl,
   });
 
   let lastError: unknown = null;
-
   const strategies: QwenDocParsingStrategy[] = ['auto', 'text_and_images', 'text_only'];
 
   for (const strategy of strategies) {
@@ -423,27 +695,27 @@ async function extractTextFromFileWithQwen(args: {
       });
 
       const normalized = normalizeExtractedText(text);
-      console.log('[qwen-doc] extracted length:', normalized.length, 'strategy=', strategy);
+      console.log('[qwen-doc non-pdf] extracted length:', normalized.length, 'strategy=', strategy);
 
       if (normalized.length >= 80) {
         return normalized;
       }
 
       lastError = new Error(
-        `Qwen document parsing returned too little content with strategy "${strategy}".`
+        `Qwen non-PDF parsing returned too little content with strategy "${strategy}".`
       );
     } catch (err) {
       lastError = err;
-      console.error('[qwen-doc] strategy failed:', strategy, err);
+      console.error('[qwen-doc non-pdf] strategy failed:', strategy, err);
     }
   }
 
   throw lastError instanceof Error
     ? lastError
-    : new Error('Qwen document parsing failed.');
+    : new Error('Qwen non-PDF parsing failed.');
 }
 
-function buildDocExtractionPrompt(args: {
+function buildWholeDocExtractionPrompt(args: {
   fileName: string;
   mimeType?: string;
 }) {
@@ -463,10 +735,10 @@ Strict requirements:
 5. Keep headings, bullet points, numbered lists, formulas, equations, captions, and emphasized terms.
 6. If a table exists, convert it into a readable Markdown table when possible; otherwise convert it into clearly labeled rows and columns.
 7. If a figure, diagram, chart, or image contains meaningful educational information, preserve that information as concise descriptive notes near the relevant section.
-8. If page or slide boundaries are obvious, add:
-   --- Page/Slide Break ---
+8. Preserve the original reading order as much as possible.
 9. Ignore clearly unreadable fragments instead of hallucinating.
 10. Output Markdown only.
+11. Do not wrap the whole output in triple backticks.
 
 File name: ${fileName}
 MIME type: ${mimeType || 'unknown'}
@@ -563,8 +835,9 @@ async function callQwenDocumentUrl(args: {
 async function generateRelevantReading(args: {
   chapterTitle: string;
   context: string;
+  pageAwareContext: string;
 }): Promise<string> {
-  const { chapterTitle, context } = args;
+  const { chapterTitle, context, pageAwareContext } = args;
 
   const prompt = `
 You are helping a university teacher create supplementary reading material for one chapter.
@@ -580,15 +853,31 @@ Requirements:
    - 2 to 3 real-world examples / case studies
    - a short "Why this matters" section
    - a short "Questions to think about" section
-3. Make it clear, educational, and student-friendly.
-4. Do NOT say "based on the provided text" or mention being an AI.
-5. Output Markdown only.
+3. After the main structure, add a final section titled:
+   ## Page-by-Page Guide
+4. In that final section, use exact subheadings:
+   ### Page 1
+   ### Page 2
+   ### Page 3
+   ...
+   matching the page numbers provided in the page map.
+5. Under each page heading, write 2 to 5 concise bullet points describing the knowledge on that page only.
+6. Do NOT skip page numbers. Do NOT merge multiple pages into one heading.
+7. If a page is mostly a title page, agenda page, transition page, recap page, or contains almost no readable text, say that briefly and accurately.
+8. Make it clear, educational, and student-friendly.
+9. Do NOT say "based on the provided text" or mention being an AI.
+10. Output Markdown only.
+11. If the page map is incomplete or missing a page, do not invent missing page content.
+12. Only describe pages that are explicitly present in the page map.
 
 Chapter title:
 ${chapterTitle}
 
 Chapter material:
 ${context}
+
+Page map:
+${pageAwareContext}
 `.trim();
 
   return await callQwenChatText(prompt, 0.4);
@@ -737,7 +1026,9 @@ async function callQwenChatText(prompt: string, temperature = 0.3): Promise<stri
 }
 
 function extractQwenText(data: any): string {
-  const content = data?.output?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.message?.content;
+  const content =
+    data?.output?.choices?.[0]?.message?.content ??
+    data?.choices?.[0]?.message?.content;
 
   if (typeof content === 'string') {
     return content.trim();
@@ -763,13 +1054,244 @@ function extractQwenText(data: any): string {
   return '';
 }
 
+function stripOuterMarkdownFence(text: string): string {
+  const trimmed = text.trim();
+
+  if (
+    /^```(?:markdown|md)?\s*/i.test(trimmed) &&
+    /\s*```$/.test(trimmed)
+  ) {
+    return trimmed
+      .replace(/^```(?:markdown|md)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+  }
+
+  return trimmed;
+}
+
 function normalizeExtractedText(text: string): string {
-  return text
+  return stripOuterMarkdownFence(text)
     .replace(/\r/g, '\n')
     .replace(/\t/g, ' ')
     .replace(/[ \u00A0]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function addPageNumbersToExtractedText(text: string): string {
+  const normalized = normalizeExtractedText(text);
+
+  const explicitPages = extractExplicitPageMarkers(normalized);
+  if (explicitPages.length > 0) {
+    return explicitPages
+      .map((section, idx) => {
+        const content = section.content.trim() || NO_READABLE_TEXT_PLACEHOLDER;
+        return `[Page ${idx + 1}]\n${content}`;
+      })
+      .join('\n\n')
+      .trim();
+  }
+
+  const canonical = normalized
+    .replace(/^\s*\[\[\s*PAGE_BREAK\s*\]\]\s*$/gim, '[[PAGE_BREAK]]')
+    .replace(/^\s*---\s*Page\/Slide Break\s*---\s*$/gim, '[[PAGE_BREAK]]')
+    .replace(/^\s*---\s*Page Break\s*---\s*$/gim, '[[PAGE_BREAK]]')
+    .replace(/^\s*---\s*Slide Break\s*---\s*$/gim, '[[PAGE_BREAK]]')
+    .replace(/(?:\n?\s*\[\[PAGE_BREAK\]\]\s*\n?){2,}/g, '\n[[PAGE_BREAK]]\n')
+    .trim();
+
+  const parts = canonical
+    .split(/\n?\s*\[\[PAGE_BREAK\]\]\s*\n?/i)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (!parts.length) {
+    return `[Page 1]\n${normalized || NO_READABLE_TEXT_PLACEHOLDER}`;
+  }
+
+  return parts
+    .map((part, idx) => `[Page ${idx + 1}]\n${part || NO_READABLE_TEXT_PLACEHOLDER}`)
+    .join('\n\n')
+    .trim();
+}
+
+function extractExplicitPageMarkers(text: string): PageSection[] {
+  const regex = /^\[\[PAGE_(\d+)\]\]\s*$/gim;
+  const matches = [...text.matchAll(regex)];
+
+  if (!matches.length) return [];
+
+  const pages: PageSection[] = [];
+
+  for (let i = 0; i < matches.length; i++) {
+    const current = matches[i];
+    const next = matches[i + 1];
+
+    const start = (current.index ?? 0) + current[0].length;
+    const end = next?.index ?? text.length;
+
+    pages.push({
+      page: i + 1,
+      content: text.slice(start, end).trim(),
+    });
+  }
+
+  return pages;
+}
+
+function extractPagesFromText(text: string): PageSection[] {
+  const regex = /^\[Page\s+(\d+)\]\s*$/gim;
+  const matches = [...text.matchAll(regex)];
+
+  if (!matches.length) {
+    const trimmed = text.trim();
+    return trimmed ? [{ page: 1, content: trimmed }] : [];
+  }
+
+  const pages: PageSection[] = [];
+
+  for (let i = 0; i < matches.length; i++) {
+    const current = matches[i];
+    const next = matches[i + 1];
+
+    const start = (current.index ?? 0) + current[0].length;
+    const end = next?.index ?? text.length;
+    const content = text.slice(start, end).trim();
+
+    pages.push({
+      page: i + 1,
+      content: content || NO_READABLE_TEXT_PLACEHOLDER,
+    });
+  }
+
+  return pages;
+}
+
+function effectivePageContentLength(text: string): number {
+  const cleaned = text
+    .replace(NO_READABLE_TEXT_PLACEHOLDER, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned.length;
+}
+
+function validatePageNumberedText(pageNumberedText: string): PageValidationResult {
+  const pages = extractPagesFromText(pageNumberedText);
+
+  if (!pages.length) {
+    return { ok: false, reason: 'No [Page n] sections found.', pageCount: 0 };
+  }
+
+  for (let i = 0; i < pages.length; i++) {
+    const expected = i + 1;
+    if (pages[i].page !== expected) {
+      return {
+        ok: false,
+        reason: `Non-sequential page numbering detected. Expected Page ${expected}, got Page ${pages[i].page}.`,
+        pageCount: pages.length,
+      };
+    }
+  }
+
+  const lengths = pages.map((p) => effectivePageContentLength(p.content));
+  const total = lengths.reduce((sum, len) => sum + len, 0);
+  const meaningfulPages = lengths.filter((len) => len >= 8).length;
+
+  if (total < 80) {
+    return {
+      ok: false,
+      reason: 'Extracted content is too short after pagination.',
+      pageCount: pages.length,
+    };
+  }
+
+  if (meaningfulPages < 1) {
+    return {
+      ok: false,
+      reason: 'No page contains readable content.',
+      pageCount: pages.length,
+    };
+  }
+
+  return {
+    ok: true,
+    pageCount: pages.length,
+  };
+}
+
+function stripPageLabelsFromExtractedText(text: string): string {
+  return text
+    .replace(/^\[Page\s+\d+\]\s*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function compactPageContent(text: string, maxLen = 320): string {
+  const cleaned = text
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (cleaned.length <= maxLen) return cleaned;
+  if (maxLen <= 100) return cleaned.slice(0, maxLen).trim();
+
+  const headLen = Math.max(60, Math.floor(maxLen * 0.72));
+  const tailLen = Math.max(24, Math.floor(maxLen * 0.18));
+
+  return [
+    cleaned.slice(0, headLen).trim(),
+    '...(omitted)...',
+    cleaned.slice(-tailLen).trim(),
+  ].join('\n');
+}
+
+function buildPageAwareContext(
+  pages: PageSection[],
+  totalMaxLen = 14000
+): string {
+  if (!pages.length) return '';
+
+  const preferredPerPage =
+    pages.length <= 8
+      ? 700
+      : pages.length <= 15
+      ? 420
+      : pages.length <= 30
+      ? 260
+      : 180;
+
+  const budgetPerPage = Math.max(
+    120,
+    Math.floor(totalMaxLen / Math.max(1, pages.length)) - 24
+  );
+
+  let perPageMax = Math.min(preferredPerPage, budgetPerPage);
+
+  let blocks = pages.map(
+    (page) =>
+      `[Page ${page.page}]\n${compactPageContent(page.content, perPageMax)}`
+  );
+
+  let joined = blocks.join('\n\n');
+
+  if (joined.length <= totalMaxLen) return joined;
+
+  perPageMax = Math.max(
+    80,
+    Math.floor(totalMaxLen / Math.max(1, pages.length)) - 24
+  );
+
+  blocks = pages.map(
+    (page) =>
+      `[Page ${page.page}]\n${compactPageContent(page.content, perPageMax)}`
+  );
+  joined = blocks.join('\n\n');
+
+  return joined.length <= totalMaxLen
+    ? joined
+    : joined.slice(0, totalMaxLen).trim();
 }
 
 function chunkText(text: string, maxLen = 1800, overlap = 200): string[] {
@@ -824,4 +1346,16 @@ function buildCondensedContext(chunks: string[]): string {
   });
 
   return selected.map((c, i) => `[Chunk ${i + 1}]\n${c}`).join('\n\n');
+}
+
+async function downloadBinaryFile(fileUrl: string): Promise<Uint8Array> {
+  const res = await fetchWithTimeout(fileUrl, {}, 120000);
+
+  if (!res.ok) {
+    const raw = await res.text().catch(() => '');
+    throw new Error(`Failed to download file: ${res.status} ${truncate(raw)}`);
+  }
+
+  const ab = await res.arrayBuffer();
+  return new Uint8Array(ab);
 }
