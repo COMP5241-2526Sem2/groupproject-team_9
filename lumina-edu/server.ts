@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 
 import processChapterMaterialHandler from './api/process-chapter-material';
 import qwenChatDocHandler from './api/qwen-chat-doc';
+import pageSummaryHandler from './api/page-summary';
 
 dotenv.config();
 
@@ -103,6 +104,10 @@ app.post('/api/process-chapter-material', async (req, res) => {
 
 app.post('/api/qwen-chat-doc', async (req, res) => {
   await runHandler(req, res, qwenChatDocHandler);
+});
+
+app.post('/api/chapters/:chapterId/page-summary', async (req, res) => {
+  await runHandler(req, res, pageSummaryHandler);
 });
 
 async function startServer() {

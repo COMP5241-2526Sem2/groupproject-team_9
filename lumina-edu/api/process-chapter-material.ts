@@ -1,3 +1,4 @@
+import JSZip from 'jszip';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 export const config = {
@@ -5,6 +6,7 @@ export const config = {
 };
 
 const NO_READABLE_TEXT_PLACEHOLDER = '[No readable text extracted for this page.]';
+const STORAGE_BUCKET = 'course-materials';
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -169,6 +171,22 @@ function isPdfFile(fileName: string, mimeType = '') {
   return normalizeMimeType(fileName, mimeType) === 'application/pdf';
 }
 
+function isPptxFile(fileName: string, mimeType = '') {
+  const resolved = normalizeMimeType(fileName, mimeType);
+  const lower = fileName.toLowerCase();
+  return (
+    resolved ===
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+    lower.endsWith('.pptx')
+  );
+}
+
+function isPptFile(fileName: string, mimeType = '') {
+  const resolved = normalizeMimeType(fileName, mimeType);
+  const lower = fileName.toLowerCase();
+  return resolved === 'application/vnd.ms-powerpoint' || lower.endsWith('.ppt');
+}
+
 async function fetchWithTimeout(
   input: RequestInfo | URL,
   init: RequestInit = {},
@@ -318,6 +336,7 @@ async function processChapterMaterial(
   }
 
   const resolvedMimeType = normalizeMimeType(fileName, mimeType);
+  const storagePath = chapter.ppt?.storagePath || null;
 
   await updateChapterProgress(supabase, chapterId, {
     content_status: 'processing',
@@ -339,6 +358,24 @@ async function processChapterMaterial(
 
     pageNumberedText = extracted.pageNumberedText;
     overallContextText = extracted.plainText;
+  } else if (isPptxFile(fileName, resolvedMimeType) || isPptFile(fileName, resolvedMimeType)) {
+    if (isPptFile(fileName, resolvedMimeType)) {
+      throw new Error(
+        'Legacy PPT files are not supported for text extraction yet. Please upload PPTX.'
+      );
+    }
+
+    if (!storagePath) {
+      throw new Error('Missing storage path for the uploaded PPTX file.');
+    }
+
+    const pptxPageNumberedText = await extractPptxPageNumberedTextFromStorage(
+      supabase,
+      storagePath
+    );
+
+    pageNumberedText = normalizeExtractedText(pptxPageNumberedText);
+    overallContextText = stripPageLabelsFromExtractedText(pageNumberedText);
   } else {
     const wholeDocText = await extractTextFromNonPdfWithQwen({
       fileUrl,
@@ -665,6 +702,85 @@ function extractGeminiText(data: any): string {
   return '';
 }
 
+function decodeXmlEntities(text: string) {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) =>
+      String.fromCharCode(parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_m, num) =>
+      String.fromCharCode(parseInt(num, 10))
+    );
+}
+
+function extractTextFromSlideXml(xml: string) {
+  const matches = [...xml.matchAll(/<a:t[^>]*>(.*?)<\/a:t>/g)];
+  const raw = matches.map((m) => decodeXmlEntities(m[1] || '')).join(' ');
+  return raw.replace(/\s+/g, ' ').trim();
+}
+
+async function extractPptxPageNumberedTextFromStorage(
+  supabase: SupabaseClient,
+  storagePath: string
+): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .download(storagePath);
+
+  if (error || !data) {
+    console.error('[pptx-extract] storage download error:', error);
+    throw new Error('Failed to download PPTX from storage.');
+  }
+
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(await data.arrayBuffer());
+  } catch (err) {
+    console.error('[pptx-extract] zip parse error:', err);
+    throw new Error('Failed to parse PPTX file.');
+  }
+
+  const slideFiles = zip.file(/ppt\/slides\/slide\d+\.xml$/) || [];
+
+  if (slideFiles.length === 0) {
+    throw new Error('No slides were found in the PPTX file.');
+  }
+
+  const slides = slideFiles
+    .map((file) => {
+      const match = file.name.match(/slide(\d+)\.xml$/);
+      return {
+        index: match ? Number(match[1]) : Number.MAX_SAFE_INTEGER,
+        name: file.name,
+      };
+    })
+    .sort((a, b) => a.index - b.index);
+
+  const pageBlocks: string[] = [];
+
+  for (let i = 0; i < slides.length; i += 1) {
+    const slideFile = zip.file(slides[i].name);
+    if (!slideFile) continue;
+
+    const xml = await slideFile.async('string');
+    const text = extractTextFromSlideXml(xml).trim();
+
+    pageBlocks.push(
+      `[Page ${i + 1}]\n${text || NO_READABLE_TEXT_PLACEHOLDER}`
+    );
+  }
+
+  if (pageBlocks.length === 0) {
+    throw new Error('No readable text was found in the PPTX slides.');
+  }
+
+  return pageBlocks.join('\n\n').trim();
+}
+
 async function extractTextFromNonPdfWithQwen(args: {
   fileUrl: string;
   fileName: string;
@@ -695,7 +811,12 @@ async function extractTextFromNonPdfWithQwen(args: {
       });
 
       const normalized = normalizeExtractedText(text);
-      console.log('[qwen-doc non-pdf] extracted length:', normalized.length, 'strategy=', strategy);
+      console.log(
+        '[qwen-doc non-pdf] extracted length:',
+        normalized.length,
+        'strategy=',
+        strategy
+      );
 
       if (normalized.length >= 80) {
         return normalized;

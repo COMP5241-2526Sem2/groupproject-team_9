@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   UploadCloud,
   FileText,
@@ -13,15 +13,14 @@ import {
   BarChart3,
   RotateCcw,
   AlertCircle,
-  Sparkles,
   Edit2,
   Check,
   X,
   Eye,
   EyeOff,
   Clock3,
+  Presentation,
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
 import QuizViewer from './QuizViewer';
 import { supabase } from '../lib/supabase';
 import { Course } from './CourseList';
@@ -48,13 +47,11 @@ export interface Chapter {
   quiz: any[];
   extracted_text?: string | null;
 
-  // 新增/推荐字段
   content_status?: string | null;
   processing_stage?: string | null;
   processing_progress?: number | null;
   processing_error?: string | null;
 
-  // 兼容你旧字段
   extract_status?: string | null;
 }
 
@@ -135,6 +132,10 @@ function getProgress(chapter?: Chapter | null) {
   return 0;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function renderDocument(chapter: Chapter) {
   if (!chapter?.ppt?.supabaseUrl) {
     return (
@@ -200,6 +201,15 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
   const [editingReading, setEditingReading] = useState('');
   const [isEditingReading, setIsEditingReading] = useState(false);
 
+  const [pageNumberInput, setPageNumberInput] = useState('1');
+  const [pageSummary, setPageSummary] = useState<string | null>(null);
+  const [pageSummaryError, setPageSummaryError] = useState<string | null>(null);
+  const [isPageSummaryLoading, setIsPageSummaryLoading] = useState(false);
+
+  const mountedRef = useRef(true);
+  const processingTriggerRef = useRef<Record<string, boolean>>({});
+  const processingMonitorRef = useRef<Record<string, boolean>>({});
+
   const activeChapter = useMemo(
     () => chapters.find((c) => c.id === activeChapterId) || null,
     [chapters, activeChapterId]
@@ -209,15 +219,172 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
   const activeChapterProgress = getProgress(activeChapter);
   const activeChapterStageLabel = getStageLabel(activeChapter);
 
-  useEffect(() => {
-    fetchChapters();
+  const upsertChapterIntoState = useCallback((nextChapter: Chapter) => {
+    if (!mountedRef.current) return;
+
+    setChapters((prev) => {
+      const idx = prev.findIndex((c) => c.id === nextChapter.id);
+      if (idx === -1) return [...prev, nextChapter];
+
+      const cloned = [...prev];
+      cloned[idx] = {
+        ...cloned[idx],
+        ...nextChapter,
+      };
+      return cloned;
+    });
+  }, []);
+
+  const fetchChapters = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('chapters')
+      .select('*')
+      .eq('course_id', course.id)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching chapters:', error);
+      return [];
+    }
+
+    const next = (data || []) as Chapter[];
+
+    if (mountedRef.current) {
+      setChapters(next);
+    }
+
+    return next;
   }, [course.id]);
+
+  const fetchSubmissions = useCallback(async () => {
+    if (!activeChapterId) return;
+
+    setIsLoadingSubmissions(true);
+    try {
+      const { data, error } = await supabase
+        .from('quiz_submissions')
+        .select('*')
+        .eq('chapter_id', activeChapterId)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      if (mountedRef.current) {
+        setSubmissions(data || []);
+      }
+    } catch (err) {
+      console.error('Error fetching submissions:', err);
+    } finally {
+      if (mountedRef.current) {
+        setIsLoadingSubmissions(false);
+      }
+    }
+  }, [activeChapterId]);
+
+  const fetchSingleChapter = useCallback(async (chapterId: string) => {
+    const { data, error } = await supabase
+      .from('chapters')
+      .select('*')
+      .eq('id', chapterId)
+      .single();
+
+    if (error) {
+      console.error('Error fetching single chapter:', error);
+      return null;
+    }
+
+    const chapter = data as Chapter;
+    upsertChapterIntoState(chapter);
+    return chapter;
+  }, [upsertChapterIntoState]);
+
+  const startMonitoringChapterStatus = useCallback(
+    async (
+      chapterId: string,
+      options?: {
+        maxAttempts?: number;
+        intervalMs?: number;
+        showFailureAlert?: boolean;
+      }
+    ) => {
+      if (processingMonitorRef.current[chapterId]) return;
+
+      processingMonitorRef.current[chapterId] = true;
+
+      const maxAttempts = options?.maxAttempts ?? 40;
+      const intervalMs = options?.intervalMs ?? 3000;
+      const showFailureAlert = options?.showFailureAlert ?? true;
+
+      try {
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+          const latest = await fetchSingleChapter(chapterId);
+
+          if (!latest) {
+            await sleep(intervalMs);
+            continue;
+          }
+
+          const status = normalizeStatus(latest);
+
+          if (status === 'ready') {
+            return latest;
+          }
+
+          if (status === 'failed') {
+            if (showFailureAlert) {
+              alert(
+                latest.processing_error ||
+                  'The chapter processing failed. Please try again.'
+              );
+            }
+            return latest;
+          }
+
+          if (status === 'queued' || status === 'processing') {
+            await sleep(intervalMs);
+            continue;
+          }
+
+          if (attempt < 4) {
+            await sleep(intervalMs);
+            continue;
+          }
+
+          return latest;
+        }
+
+        return await fetchSingleChapter(chapterId);
+      } finally {
+        delete processingMonitorRef.current[chapterId];
+      }
+    },
+    [fetchSingleChapter]
+  );
+
+  const markChapterAsQueuedLocally = useCallback((chapter: Chapter) => {
+    upsertChapterIntoState({
+      ...chapter,
+      content_status: 'queued',
+      processing_stage: 'queued',
+      processing_progress: Math.max(5, Number(chapter.processing_progress || 0)),
+      processing_error: null,
+    });
+  }, [upsertChapterIntoState]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    void fetchChapters();
+
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [fetchChapters]);
 
   useEffect(() => {
     if (activeChapterId && activeTab === 'analytics') {
-      fetchSubmissions();
+      void fetchSubmissions();
     }
-  }, [activeChapterId, activeTab]);
+  }, [activeChapterId, activeTab, fetchSubmissions]);
 
   useEffect(() => {
     if (chapters.length === 0) {
@@ -242,7 +409,7 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
           filter: `course_id=eq.${course.id}`,
         },
         () => {
-          fetchChapters();
+          void fetchChapters();
         }
       )
       .subscribe();
@@ -258,7 +425,7 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
         },
         () => {
           if (activeTab === 'analytics' && activeChapterId) {
-            fetchSubmissions();
+            void fetchSubmissions();
           }
         }
       )
@@ -268,7 +435,7 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
       chapterSubscription.unsubscribe();
       submissionSubscription.unsubscribe();
     };
-  }, [course.id, activeTab, activeChapterId]);
+  }, [course.id, activeTab, activeChapterId, fetchChapters, fetchSubmissions]);
 
   useEffect(() => {
     if (!activeChapter) return;
@@ -277,49 +444,20 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
     if (!['queued', 'processing'].includes(status)) return;
 
     const interval = setInterval(() => {
-      fetchChapters();
+      void fetchChapters();
       if (activeTab === 'analytics' && activeChapterId) {
-        fetchSubmissions();
+        void fetchSubmissions();
       }
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [activeChapter, activeTab, activeChapterId]);
+  }, [activeChapter, activeTab, activeChapterId, fetchChapters, fetchSubmissions]);
 
-  const fetchChapters = async () => {
-    const { data, error } = await supabase
-      .from('chapters')
-      .select('*')
-      .eq('course_id', course.id)
-      .order('created_at', { ascending: true });
-
-    if (error) {
-      console.error('Error fetching chapters:', error);
-      return;
-    }
-
-    setChapters((data || []) as Chapter[]);
-  };
-
-  const fetchSubmissions = async () => {
-    if (!activeChapterId) return;
-
-    setIsLoadingSubmissions(true);
-    try {
-      const { data, error } = await supabase
-        .from('quiz_submissions')
-        .select('*')
-        .eq('chapter_id', activeChapterId)
-        .order('created_at', { ascending: false });
-
-      if (error) throw error;
-      setSubmissions(data || []);
-    } catch (err) {
-      console.error('Error fetching submissions:', err);
-    } finally {
-      setIsLoadingSubmissions(false);
-    }
-  };
+  useEffect(() => {
+    setPageSummary(null);
+    setPageSummaryError(null);
+    setPageNumberInput('1');
+  }, [activeChapterId]);
 
   const calculateAnalytics = () => {
     if (submissions.length === 0 || !activeChapter?.quiz?.length) return null;
@@ -404,8 +542,6 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
     setIsEditingChapterTitle(false);
   };
 
-  const processingTriggerRef = useRef<Record<string, boolean>>({});
-
   const triggerAutoProcessing = async (
     chapter: Chapter,
     fileMeta: { fileUrl: string; fileName: string; mimeType: string }
@@ -416,6 +552,8 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
     }
 
     processingTriggerRef.current[chapter.id] = true;
+
+    markChapterAsQueuedLocally(chapter);
 
     try {
       const response = await fetch('/api/process-chapter-material', {
@@ -442,31 +580,167 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
       console.log('[triggerAutoProcessing] response status:', response.status);
       console.log('[triggerAutoProcessing] response body:', result || rawText);
 
-      if (!response.ok) {
-        throw new Error(
-          result?.error ||
-            `Processing request failed with status ${response.status}`
-        );
-      }
-
-      // 后端返回 ok:true 即认为启动成功
-      if (result?.ok) {
+      if (response.ok && result?.ok) {
         await fetchChapters();
+
+        const latest = await fetchSingleChapter(chapter.id);
+        const latestStatus = normalizeStatus(latest);
+
+        if (latestStatus === 'queued' || latestStatus === 'processing') {
+          void startMonitoringChapterStatus(chapter.id, {
+            maxAttempts: 120,
+            intervalMs: 3000,
+            showFailureAlert: true,
+          });
+        }
+
         return;
       }
 
-      throw new Error(result?.error || 'Failed to start chapter processing.');
+      if (response.status === 504) {
+        console.warn(
+          '[triggerAutoProcessing] 504 received; continuing to monitor chapter status instead of failing immediately.'
+        );
+
+        await fetchChapters();
+        void startMonitoringChapterStatus(chapter.id, {
+          maxAttempts: 120,
+          intervalMs: 3000,
+          showFailureAlert: true,
+        });
+        return;
+      }
+
+      const latest = await fetchSingleChapter(chapter.id);
+      const latestStatus = normalizeStatus(latest);
+
+      if (
+        latestStatus === 'queued' ||
+        latestStatus === 'processing' ||
+        latestStatus === 'ready'
+      ) {
+        console.warn(
+          '[triggerAutoProcessing] non-OK response but chapter is already progressing; continuing to monitor.',
+          {
+            responseStatus: response.status,
+            latestStatus,
+          }
+        );
+
+        void startMonitoringChapterStatus(chapter.id, {
+          maxAttempts: 120,
+          intervalMs: 3000,
+          showFailureAlert: true,
+        });
+        return;
+      }
+
+      throw new Error(
+        result?.error ||
+          `Processing request failed with status ${response.status}`
+      );
     } catch (error: any) {
       console.error('Auto processing trigger failed:', error);
 
-      // 关键：不要立刻写 failed
-      // 因为长任务接口可能只是慢/超时，后端未必真的没在跑
-      await fetchChapters();
+      const latest = await fetchSingleChapter(chapter.id);
+      const latestStatus = normalizeStatus(latest);
 
-      // 可选：如果你一定要展示提示，用 alert 或 toast，但不要把数据库状态直接打成 failed
-      alert(error?.message || 'Processing request did not complete normally. Please check again in a moment.');
+      if (
+        latestStatus === 'queued' ||
+        latestStatus === 'processing' ||
+        latestStatus === 'ready'
+      ) {
+        console.warn(
+          '[triggerAutoProcessing] request errored, but chapter is progressing; continuing to monitor.'
+        );
+
+        void startMonitoringChapterStatus(chapter.id, {
+          maxAttempts: 120,
+          intervalMs: 3000,
+          showFailureAlert: true,
+        });
+        return;
+      }
+
+      const errorMessage =
+        error?.message || 'Processing request did not complete normally. Please check again in a moment.';
+
+      alert(errorMessage);
     } finally {
       processingTriggerRef.current[chapter.id] = false;
+    }
+  };
+
+  const handleGeneratePageSummary = async () => {
+    if (!activeChapter) return;
+
+    const pageNumber = Number(pageNumberInput);
+    if (!Number.isFinite(pageNumber) || pageNumber < 1) {
+      setPageSummary(null);
+      setPageSummaryError('Please enter a valid page number (1 or higher).');
+      return;
+    }
+
+    if (activeChapterStatus !== 'ready') {
+      setPageSummary(null);
+      setPageSummaryError(
+        activeChapterStatus === 'failed'
+          ? 'This chapter failed processing, so a summary cannot be generated.'
+          : 'This chapter is still being processed. Please try again later.'
+      );
+      return;
+    }
+
+    if (!activeChapter.ppt?.supabaseUrl) {
+      setPageSummary(null);
+      setPageSummaryError('No document has been uploaded for this chapter yet.');
+      return;
+    }
+
+    setIsPageSummaryLoading(true);
+    setPageSummary(null);
+    setPageSummaryError(null);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
+
+    try {
+      const response = await fetch(
+        `/api/chapters/${encodeURIComponent(activeChapter.id)}/page-summary`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pageNumber: Math.floor(pageNumber) }),
+          signal: controller.signal,
+        }
+      );
+
+      const text = await response.text();
+      let result: any = null;
+
+      try {
+        result = JSON.parse(text);
+      } catch {
+        throw new Error(`The API returned invalid JSON: ${text.slice(0, 200)}`);
+      }
+
+      if (!response.ok || !result?.ok) {
+        throw new Error(result?.error || 'Failed to generate summary.');
+      }
+
+      setPageSummary(result.summary || 'No summary was generated.');
+    } catch (error: any) {
+      console.error('Page summary error:', error);
+      const errorMessage =
+        error?.name === 'AbortError'
+          ? 'The request timed out. Please try again.'
+          : error?.message || 'An error occurred while generating the summary.';
+      setPageSummaryError(errorMessage);
+    } finally {
+      clearTimeout(timeoutId);
+      if (mountedRef.current) {
+        setIsPageSummaryLoading(false);
+      }
     }
   };
 
@@ -489,16 +763,28 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
       processing_error: null,
     });
 
-    await triggerAutoProcessing(activeChapter, {
-      fileUrl: activeChapter.ppt.supabaseUrl,
-      fileName: activeChapter.ppt.originalName || 'document',
-      mimeType: activeChapter.mime_type || 'application/pdf',
-    });
+    await triggerAutoProcessing(
+      {
+        ...activeChapter,
+        ppt: nextPpt,
+        quiz: [],
+        extracted_text: null,
+        content_status: 'idle',
+        processing_stage: null,
+        processing_progress: 0,
+        processing_error: null,
+      },
+      {
+        fileUrl: activeChapter.ppt.supabaseUrl,
+        fileName: activeChapter.ppt.originalName || 'document',
+        mimeType: activeChapter.mime_type || 'application/pdf',
+      }
+    );
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !activeChapterId || !activeChapter) return;
+    if (!file || !activeChapterId || !activeChapter || isUploading) return;
 
     setIsUploading(true);
     setUploadProgress(10);
@@ -550,7 +836,6 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
 
       setUploadProgress(100);
 
-      // 上传成功后自动触发处理，不需要老师手动再点
       void triggerAutoProcessing(
         {
           ...activeChapter,
@@ -575,8 +860,11 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
       console.error('Error uploading file:', error);
       alert(error.message || 'Failed to upload file');
     } finally {
-      setIsUploading(false);
-      setUploadProgress(0);
+      if (mountedRef.current) {
+        setIsUploading(false);
+        setUploadProgress(0);
+      }
+
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
@@ -1295,13 +1583,74 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
                         {renderDocument(activeChapter)}
                       </div>
                     </div>
+
+                    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm p-6">
+                      <div className="flex items-center gap-3 mb-4">
+                        <Presentation className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+                        <h3 className="font-semibold text-slate-800 dark:text-slate-200">
+                          Page Summary Preview
+                        </h3>
+                      </div>
+
+                      <p className="text-sm text-slate-600 dark:text-slate-400 mb-4">
+                        Enter a page number to generate an AI summary for that page. Both PDF and PPT/PPTX are supported, as long as the backend has completed the corresponding page-aware processing.
+                      </p>
+
+                      <div className="flex items-center gap-3 mb-4">
+                        <input
+                          type="number"
+                          min={1}
+                          value={pageNumberInput}
+                          onChange={(e) => setPageNumberInput(e.target.value)}
+                          className="w-24 px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                          disabled={isPageSummaryLoading || activeChapterStatus !== 'ready'}
+                          placeholder="Page"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleGeneratePageSummary}
+                          disabled={isPageSummaryLoading || activeChapterStatus !== 'ready'}
+                          className="px-4 py-2 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {isPageSummaryLoading ? 'Generating...' : 'Generate Summary'}
+                        </button>
+                      </div>
+
+                      {isPageSummaryLoading && (
+                        <div className="flex items-center gap-2 text-sm text-indigo-600 dark:text-indigo-400 mb-4">
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Generating summary...</span>
+                        </div>
+                      )}
+
+                      {pageSummaryError && (
+                        <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800/30 rounded-lg p-3 mb-4">
+                          {pageSummaryError}
+                        </div>
+                      )}
+
+                      {pageSummary && !pageSummaryError && (
+                        <div className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800/30 rounded-lg p-4">
+                          <div className="prose prose-sm max-w-none dark:prose-invert prose-indigo">
+                            <Markdown>{pageSummary}</Markdown>
+                          </div>
+                        </div>
+                      )}
+
+                      {activeChapterStatus !== 'ready' && (
+                        <div className="text-sm text-slate-500 dark:text-slate-400">
+                          {activeChapterStatus === 'failed'
+                            ? 'This chapter failed processing, so a page summary cannot be generated.'
+                            : `This chapter is still being processed (${activeChapterStageLabel}, ${activeChapterProgress}%). Page summaries will be available once processing is complete.`}
+                        </div>
+                      )}
+                    </div>
                   </>
                 )}
               </div>
             )}
 
             {activeTab === 'reading' && renderReadingTab()}
-
             {activeTab === 'quiz' && renderQuizTab()}
 
             {activeTab === 'analytics' && (

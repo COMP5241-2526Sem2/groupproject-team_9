@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import {
   Send,
   Bot,
@@ -110,6 +110,11 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  const [pageNumberInput, setPageNumberInput] = useState('1');
+  const [pageSummary, setPageSummary] = useState<string | null>(null);
+  const [pageSummaryError, setPageSummaryError] = useState<string | null>(null);
+  const [isPageSummaryLoading, setIsPageSummaryLoading] = useState(false);
+
   const [activeContentTab, setActiveContentTab] = useState<'material' | 'reading' | 'quiz'>('material');
   const [submission, setSubmission] = useState<any>(null);
   const [isLoadingSubmission, setIsLoadingSubmission] = useState(false);
@@ -121,6 +126,10 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   const [isDraggingLeft, setIsDraggingLeft] = useState(false);
   const [isDraggingRight, setIsDraggingRight] = useState(false);
 
+  const mountedRef = useRef(true);
+  const chatAbortRef = useRef<AbortController | null>(null);
+  const pageSummaryAbortRef = useRef<AbortController | null>(null);
+
   const activeChapter = useMemo(
     () => chapters.find((c) => c.id === activeChapterId) || null,
     [chapters, activeChapterId]
@@ -129,6 +138,88 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   const activeChapterStatus = normalizeStatus(activeChapter);
   const activeChapterProgress = getProgress(activeChapter);
   const activeChapterStageLabel = getStageLabel(activeChapter);
+
+  const tutorAvailable = activeChapterStatus === 'ready';
+  const readingAvailable =
+    activeChapterStatus === 'ready' &&
+    !!activeChapter?.ppt?.relevant_reading &&
+    !!activeChapter?.ppt?.is_reading_published;
+  const quizAvailable =
+    activeChapterStatus === 'ready' &&
+    !!activeChapter?.quiz &&
+    activeChapter.quiz.length > 0;
+
+  const fetchChapters = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('chapters')
+      .select('*')
+      .eq('course_id', course.id)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching chapters:', error);
+      return [];
+    }
+
+    const nextChapters = (data || []) as Chapter[];
+
+    if (!mountedRef.current) return nextChapters;
+
+    setChapters(nextChapters);
+
+    setActiveChapterId((prev) => {
+      if (nextChapters.length === 0) return null;
+      if (!prev) return nextChapters[0].id;
+      if (!nextChapters.some((chapter) => chapter.id === prev)) {
+        return nextChapters[0].id;
+      }
+      return prev;
+    });
+
+    return nextChapters;
+  }, [course.id]);
+
+  const fetchSubmission = useCallback(async (chapterId?: string | null) => {
+    const targetChapterId = chapterId ?? activeChapterId;
+    if (!targetChapterId || !user.id) return;
+
+    setIsLoadingSubmission(true);
+    try {
+      const { data, error } = await supabase
+        .from('quiz_submissions')
+        .select('*')
+        .eq('chapter_id', targetChapterId)
+        .eq('student_id', user.id)
+        .maybeSingle();
+
+      if (error) throw error;
+
+      if (!mountedRef.current) return;
+
+      setSubmission(data);
+    } catch (err) {
+      console.error('Error fetching submission:', err);
+    } finally {
+      if (mountedRef.current) {
+        setIsLoadingSubmission(false);
+      }
+    }
+  }, [activeChapterId, user.id]);
+
+  const scrollToBottom = useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    void fetchChapters();
+
+    return () => {
+      mountedRef.current = false;
+      chatAbortRef.current?.abort();
+      pageSummaryAbortRef.current?.abort();
+    };
+  }, [fetchChapters]);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -165,8 +256,6 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   }, [isDraggingLeft, isDraggingRight]);
 
   useEffect(() => {
-    fetchChapters();
-
     const chapterSubscription = supabase
       .channel(`student-chapters-${course.id}`)
       .on(
@@ -178,7 +267,7 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
           filter: `course_id=eq.${course.id}`,
         },
         () => {
-          fetchChapters();
+          void fetchChapters();
         }
       )
       .subscribe();
@@ -194,7 +283,7 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
           filter: `student_id=eq.${user.id}`,
         },
         () => {
-          fetchSubmission();
+          void fetchSubmission();
         }
       )
       .subscribe();
@@ -203,7 +292,7 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       chapterSubscription.unsubscribe();
       submissionSubscription.unsubscribe();
     };
-  }, [course.id, user.id]);
+  }, [course.id, user.id, fetchChapters, fetchSubmission]);
 
   useEffect(() => {
     if (!activeChapter) return;
@@ -212,67 +301,38 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
     if (!['queued', 'processing'].includes(status)) return;
 
     const interval = setInterval(() => {
-      fetchChapters();
+      void fetchChapters();
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [activeChapter]);
-
-  const fetchChapters = async () => {
-    const { data, error } = await supabase
-      .from('chapters')
-      .select('*')
-      .eq('course_id', course.id)
-      .order('created_at', { ascending: true });
-
-    if (error) {
-      console.error('Error fetching chapters:', error);
-      return;
-    }
-
-    if (data) {
-      setChapters(data as Chapter[]);
-      if (data.length > 0 && !activeChapterId) {
-        setActiveChapterId(data[0].id);
-      }
-    }
-  };
-
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  }, [activeChapter, fetchChapters]);
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, scrollToBottom]);
 
   useEffect(() => {
     setMessages([]);
+    setPageSummary(null);
+    setPageSummaryError(null);
+    setPageNumberInput('1');
+    setSubmission(null);
+
+    chatAbortRef.current?.abort();
+    pageSummaryAbortRef.current?.abort();
+    setIsLoading(false);
+    setIsPageSummaryLoading(false);
+
     if (activeChapterId) {
-      fetchSubmission();
+      void fetchSubmission(activeChapterId);
     }
-  }, [activeChapterId]);
+  }, [activeChapterId, fetchSubmission]);
 
-  const fetchSubmission = async () => {
-    if (!activeChapterId || !user.id) return;
-
-    setIsLoadingSubmission(true);
-    try {
-      const { data, error } = await supabase
-        .from('quiz_submissions')
-        .select('*')
-        .eq('chapter_id', activeChapterId)
-        .eq('student_id', user.id)
-        .maybeSingle();
-
-      if (error) throw error;
-      setSubmission(data);
-    } catch (err) {
-      console.error('Error fetching submission:', err);
-    } finally {
-      setIsLoadingSubmission(false);
+  useEffect(() => {
+    if (activeContentTab === 'reading' && !readingAvailable) {
+      setActiveContentTab('material');
     }
-  };
+  }, [activeContentTab, readingAvailable]);
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -313,7 +373,9 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
 
     setIsLoading(true);
 
+    chatAbortRef.current?.abort();
     const controller = new AbortController();
+    chatAbortRef.current = controller;
     const timeoutId = setTimeout(() => controller.abort(), 45000);
 
     try {
@@ -341,6 +403,8 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
         throw new Error(result?.error || 'Failed to get response from AI tutor.');
       }
 
+      if (!mountedRef.current) return;
+
       setMessages((prev) => [
         ...prev,
         {
@@ -350,6 +414,8 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       ]);
     } catch (error: any) {
       console.error('Chat error:', error);
+
+      if (!mountedRef.current) return;
 
       const errorMessage =
         error?.name === 'AbortError'
@@ -365,7 +431,95 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       ]);
     } finally {
       clearTimeout(timeoutId);
-      setIsLoading(false);
+      if (chatAbortRef.current === controller) {
+        chatAbortRef.current = null;
+      }
+      if (mountedRef.current) {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  const handleGeneratePageSummary = async () => {
+    if (!activeChapter) return;
+
+    const pageNumber = Number(pageNumberInput);
+    if (!Number.isFinite(pageNumber) || pageNumber < 1) {
+      setPageSummary(null);
+      setPageSummaryError('Please enter a valid page number (1 or higher).');
+      return;
+    }
+
+    if (!activeChapter.ppt?.supabaseUrl) {
+      setPageSummary(null);
+      setPageSummaryError('No chapter material is available yet.');
+      return;
+    }
+
+    if (activeChapterStatus !== 'ready') {
+      setPageSummary(null);
+      setPageSummaryError(
+        activeChapterStatus === 'failed'
+          ? 'This chapter failed processing, so summaries are unavailable.'
+          : 'This chapter is still being processed. Please try again soon.'
+      );
+      return;
+    }
+
+    setIsPageSummaryLoading(true);
+    setPageSummary(null);
+    setPageSummaryError(null);
+
+    pageSummaryAbortRef.current?.abort();
+    const controller = new AbortController();
+    pageSummaryAbortRef.current = controller;
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
+
+    try {
+      const response = await fetch(
+        `/api/chapters/${encodeURIComponent(activeChapter.id)}/page-summary`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pageNumber: Math.floor(pageNumber) }),
+          signal: controller.signal,
+        }
+      );
+
+      const text = await response.text();
+      let result: any = null;
+
+      try {
+        result = JSON.parse(text);
+      } catch {
+        throw new Error(`API did not return valid JSON: ${text.slice(0, 200)}`);
+      }
+
+      if (!response.ok || !result?.ok) {
+        throw new Error(result?.error || 'Failed to generate summary.');
+      }
+
+      if (!mountedRef.current) return;
+
+      setPageSummary(result.summary || 'No summary was generated.');
+    } catch (error: any) {
+      console.error('Page summary error:', error);
+
+      if (!mountedRef.current) return;
+
+      const errorMessage =
+        error?.name === 'AbortError'
+          ? 'The request took too long and was cancelled. Please try again.'
+          : error?.message || 'Sorry, I encountered an error while generating the summary.';
+      setPageSummaryError(errorMessage);
+    } finally {
+      clearTimeout(timeoutId);
+      if (pageSummaryAbortRef.current === controller) {
+        pageSummaryAbortRef.current = null;
+      }
+      if (mountedRef.current) {
+        setIsPageSummaryLoading(false);
+      }
     }
   };
 
@@ -503,16 +657,6 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
 
     return null;
   };
-
-  const tutorAvailable = activeChapterStatus === 'ready';
-  const readingAvailable =
-    activeChapterStatus === 'ready' &&
-    !!activeChapter?.ppt?.relevant_reading &&
-    !!activeChapter?.ppt?.is_reading_published;
-  const quizAvailable =
-    activeChapterStatus === 'ready' &&
-    !!activeChapter?.quiz &&
-    activeChapter.quiz.length > 0;
 
   return (
     <div className="flex h-[calc(100vh-8rem)] relative">
@@ -731,7 +875,7 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
                       studentId={user.id}
                       studentName={user.name}
                       initialSubmission={submission}
-                      onComplete={() => fetchSubmission()}
+                      onComplete={() => void fetchSubmission()}
                     />
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-slate-500 dark:text-slate-400">
@@ -798,6 +942,55 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
             </div>
           )}
 
+          <div className="flex-shrink-0 p-4 border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800">
+            <div className="flex items-center gap-2 mb-2">
+              <Presentation className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+              <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                Slide Page Summary
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={1}
+                value={pageNumberInput}
+                onChange={(e) => setPageNumberInput(e.target.value)}
+                className="w-24 px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                disabled={isPageSummaryLoading || !tutorAvailable}
+                aria-label="Page number"
+              />
+              <button
+                type="button"
+                onClick={handleGeneratePageSummary}
+                disabled={isPageSummaryLoading || !tutorAvailable}
+                className="px-3 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isPageSummaryLoading ? 'Generating...' : 'Generate Summary'}
+              </button>
+            </div>
+
+            {isPageSummaryLoading && (
+              <div className="mt-3 flex items-center gap-2 text-sm text-emerald-600 dark:text-emerald-400">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Generating summary...</span>
+              </div>
+            )}
+
+            {pageSummaryError && (
+              <div className="mt-3 text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800/30 rounded-lg p-3">
+                {pageSummaryError}
+              </div>
+            )}
+          </div>
+
+          {pageSummary && !pageSummaryError && (
+            <div className="flex-1 overflow-y-auto bg-emerald-50 dark:bg-emerald-900/20 border-b border-emerald-100 dark:border-emerald-800/30 p-4">
+              <div className="prose prose-sm max-w-none dark:prose-invert prose-emerald">
+                <Markdown>{pageSummary}</Markdown>
+              </div>
+            </div>
+          )}
+
           <div className="flex-1 overflow-y-auto p-4 space-y-6 bg-slate-50 dark:bg-slate-900/50">
             {messages.length === 0 && (
               <div className="text-center text-slate-500 dark:text-slate-400 mt-10">
@@ -828,7 +1021,7 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
                   <div
                     className={`max-w-[80%] rounded-2xl p-4 ${
                       msg.role === 'user'
-                        ? 'bg-indigo-600 text-white rounded-tr-none'
+                        ? 'bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800/30 text-indigo-900 dark:text-indigo-100 rounded-tr-none shadow-sm'
                         : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded-tl-none shadow-sm'
                     }`}
                   >
