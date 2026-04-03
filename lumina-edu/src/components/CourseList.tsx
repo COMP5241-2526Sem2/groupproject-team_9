@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { BookOpen, Plus, Search, Users, Presentation, ArrowRight, Hash, Edit2, X } from 'lucide-react';
+import { BookOpen, Plus, Search, Users, Presentation, ArrowRight, Hash, Edit2, X, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 export interface Course {
@@ -8,6 +8,8 @@ export interface Course {
   code: string;
   description: string;
   teacherName: string;
+  isEnrolled?: boolean; // For students: whether they are enrolled in this course
+  teacherId?: string; // For filtering student view
 }
 
 interface CourseListProps {
@@ -18,14 +20,18 @@ interface CourseListProps {
   onCreateCourse: (name: string, description: string) => void;
   onJoinCourse: (code: string) => void;
   onUpdateCourse: (id: string, name: string, description: string) => void;
+  onEnrollCourse?: (courseId: string) => Promise<void>; // For direct enrollment from course card
+  onUnenrollCourse?: (courseId: string) => Promise<void>; // For direct unenrollment from course card
   searchQuery: string;
   onSearchChange: (query: string) => void;
 }
 
-export default function CourseList({ role, userName, courses, onSelectCourse, onCreateCourse, onJoinCourse, onUpdateCourse, searchQuery, onSearchChange }: CourseListProps) {
+export default function CourseList({ role, userName, courses, onSelectCourse, onCreateCourse, onJoinCourse, onUpdateCourse, onEnrollCourse, onUnenrollCourse, searchQuery, onSearchChange }: CourseListProps) {
   const [isCreating, setIsCreating] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
   const [editingCourse, setEditingCourse] = useState<Course | null>(null);
+  const [enrollingCourseId, setEnrollingCourseId] = useState<string | null>(null);
+  const [unenrollingCourseId, setUnenrollingCourseId] = useState<string | null>(null);
   
   const [newCourseName, setNewCourseName] = useState('');
   const [newCourseDesc, setNewCourseDesc] = useState('');
@@ -70,6 +76,34 @@ export default function CourseList({ role, userName, courses, onSelectCourse, on
     setEditingCourse(course);
     setEditCourseName(course.name);
     setEditCourseDesc(course.description);
+  };
+
+  const handleEnrollClick = async (e: React.MouseEvent, courseId: string) => {
+    e.stopPropagation();
+    if (!onEnrollCourse) return;
+    setEnrollingCourseId(courseId);
+    try {
+      await onEnrollCourse(courseId);
+    } catch (error) {
+      console.error('Failed to enroll in course:', error);
+      alert('Failed to enroll in course. Please try again.');
+    } finally {
+      setEnrollingCourseId(null);
+    }
+  };
+
+  const handleUnenrollClick = async (e: React.MouseEvent, courseId: string) => {
+    e.stopPropagation();
+    if (!onUnenrollCourse) return;
+    setUnenrollingCourseId(courseId);
+    try {
+      await onUnenrollCourse(courseId);
+    } catch (error) {
+      console.error('Failed to unenroll from course:', error);
+      alert('Failed to unenroll from course. Please try again.');
+    } finally {
+      setUnenrollingCourseId(null);
+    }
   };
 
   return (
@@ -244,11 +278,17 @@ export default function CourseList({ role, userName, courses, onSelectCourse, on
             <motion.div
               key={course.id}
               whileHover={{ y: -4 }}
-              onClick={() => onSelectCourse(course)}
-              className="bg-white dark:bg-slate-800 rounded-2xl p-6 border border-slate-100 dark:border-slate-700 shadow-sm hover:shadow-md transition-all cursor-pointer group"
+              onClick={() => {
+                // For students: only enter course if already enrolled
+                if (role === 'student' && !course.isEnrolled) return;
+                onSelectCourse(course);
+              }}
+              className={`bg-white dark:bg-slate-800 rounded-2xl p-6 border border-slate-100 dark:border-slate-700 shadow-sm hover:shadow-md transition-all group ${
+                role === 'student' && !course.isEnrolled ? 'cursor-default' : 'cursor-pointer'
+              }`}
             >
               <div className="flex justify-between items-start mb-4">
-                <div className={`p-3 rounded-xl ${role === 'teacher' ? 'bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400' : 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400'}`}>
+                <div className={`p-3 rounded-xl ${role === 'teacher' ? 'bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400' : course.isEnrolled ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400' : 'bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400'}`}>
                   <BookOpen className="w-6 h-6" />
                 </div>
                 <div className="flex items-center gap-2">
@@ -267,6 +307,9 @@ export default function CourseList({ role, userName, courses, onSelectCourse, on
                       </div>
                     </>
                   )}
+                  {role === 'student' && course.isEnrolled && (
+                    <span className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/30 px-2 py-1 rounded-lg">Enrolled</span>
+                  )}
                 </div>
               </div>
               
@@ -282,7 +325,41 @@ export default function CourseList({ role, userName, courses, onSelectCourse, on
                   <Presentation className="w-4 h-4" />
                   <span>{course.teacherName}</span>
                 </div>
-                <ArrowRight className={`w-5 h-5 ${role === 'teacher' ? 'text-emerald-500' : 'text-indigo-500'} opacity-0 group-hover:opacity-100 transition-opacity -translate-x-2 group-hover:translate-x-0 duration-300`} />
+                
+                {role === 'student' ? (
+                  course.isEnrolled ? (
+                    <button
+                      onClick={(e) => handleUnenrollClick(e, course.id)}
+                      disabled={unenrollingCourseId === course.id}
+                      className="flex items-center gap-2 text-sm px-3 py-1 bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/50 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                      title="Unenroll from this course"
+                    >
+                      {unenrollingCourseId === course.id ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <>Leave</>
+                      )}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={(e) => handleEnrollClick(e, course.id)}
+                      disabled={enrollingCourseId === course.id}
+                      className="flex items-center gap-2 text-sm px-3 py-1 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                      title="Enroll in this course"
+                    >
+                      {enrollingCourseId === course.id ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <>
+                          <Plus className="w-3 h-3" />
+                          Join
+                        </>
+                      )}
+                    </button>
+                  )
+                ) : (
+                  <ArrowRight className={`w-5 h-5 ${role === 'teacher' ? 'text-emerald-500' : 'text-indigo-500'} opacity-0 group-hover:opacity-100 transition-opacity -translate-x-2 group-hover:translate-x-0 duration-300`} />
+                )}
               </div>
             </motion.div>
           ))}

@@ -262,30 +262,46 @@ function AppContent() {
               code: d.code,
               description: d.description,
               teacherName: d.teacher_name,
+              teacherId: d.teacher_id,
             }))
           );
         }
       } else {
-        const { data, error } = await supabase
-          .from('enrollments')
-          .select('course_id, courses(*)')
-          .eq('student_id', user.id)
+        // For students: fetch ALL courses, and mark which ones they're enrolled in
+        const { data: allCourses, error: coursesError } = await supabase
+          .from('courses')
+          .select('*')
           .order('created_at', { ascending: false });
 
-        if (error) {
-          console.error('Error fetching enrolled courses:', error);
+        if (coursesError) {
+          console.error('Error fetching all courses:', coursesError);
           return;
         }
 
-        if (data) {
-          const enrolledCourses = data.map((d: any) => ({
-            id: d.courses.id,
-            name: d.courses.name,
-            code: d.courses.code,
-            description: d.courses.description,
-            teacherName: d.courses.teacher_name,
+        // Fetch student's enrollments
+        const { data: enrollments, error: enrollmentsError } = await supabase
+          .from('enrollments')
+          .select('course_id')
+          .eq('student_id', user.id);
+
+        if (enrollmentsError) {
+          console.error('Error fetching enrollments:', enrollmentsError);
+          return;
+        }
+
+        const enrolledCourseIds = new Set((enrollments || []).map((e) => e.course_id));
+
+        if (allCourses) {
+          const courseList = allCourses.map((d) => ({
+            id: d.id,
+            name: d.name,
+            code: d.code,
+            description: d.description,
+            teacherName: d.teacher_name,
+            teacherId: d.teacher_id,
+            isEnrolled: enrolledCourseIds.has(d.id),
           }));
-          setCourses(enrolledCourses);
+          setCourses(courseList);
         }
       }
     } catch (error) {
@@ -345,6 +361,7 @@ function AppContent() {
             code: data.code,
             description: data.description,
             teacherName: data.teacher_name,
+            teacherId: data.teacher_id,
           },
           ...prev,
         ]);
@@ -404,21 +421,75 @@ function AppContent() {
         return;
       }
 
-      setCourses((prev) => [
-        {
-          id: course.id,
-          name: course.name,
-          code: course.code,
-          description: course.description,
-          teacherName: course.teacher_name,
-        },
-        ...prev,
-      ]);
+      // Update courses list to mark as enrolled
+      setCourses((prev) => 
+        prev.map((c) => 
+          c.id === course.id ? { ...c, isEnrolled: true } : c
+        )
+      );
 
       alert(`Successfully joined ${course.name}!`);
     } catch (error) {
       console.error('Join course error:', error);
       alert('Failed to join course.');
+    }
+  };
+
+  const handleEnrollCourse = async (courseId: string) => {
+    if (!user) return;
+
+    try {
+      const { error: enrollError } = await supabase
+        .from('enrollments')
+        .insert([{ course_id: courseId, student_id: user.id }]);
+
+      if (enrollError) {
+        if (enrollError.message.includes('violates unique constraint')) {
+          alert('You are already enrolled in this course.');
+          return;
+        }
+        console.error(enrollError);
+        alert('Failed to enroll in course.');
+        return;
+      }
+
+      // Update courses list to mark as enrolled
+      setCourses((prev) => 
+        prev.map((c) => 
+          c.id === courseId ? { ...c, isEnrolled: true } : c
+        )
+      );
+    } catch (error) {
+      console.error('Enroll course error:', error);
+      throw error;
+    }
+  };
+
+  const handleUnenrollCourse = async (courseId: string) => {
+    if (!user) return;
+
+    try {
+      const { error } = await supabase
+        .from('enrollments')
+        .delete()
+        .eq('course_id', courseId)
+        .eq('student_id', user.id);
+
+      if (error) {
+        console.error(error);
+        alert('Failed to unenroll from course.');
+        return;
+      }
+
+      // Update courses list to mark as not enrolled
+      setCourses((prev) => 
+        prev.map((c) => 
+          c.id === courseId ? { ...c, isEnrolled: false } : c
+        )
+      );
+    } catch (error) {
+      console.error('Unenroll course error:', error);
+      throw error;
     }
   };
 
@@ -504,6 +575,8 @@ function AppContent() {
             onCreateCourse={handleCreateCourse}
             onJoinCourse={handleJoinCourse}
             onUpdateCourse={handleUpdateCourse}
+            onEnrollCourse={user.role === 'student' ? handleEnrollCourse : undefined}
+            onUnenrollCourse={user.role === 'student' ? handleUnenrollCourse : undefined}
             searchQuery={searchQuery}
             onSearchChange={setSearchQuery}
           />
