@@ -9,6 +9,12 @@ export default defineConfig(({mode}) => {
     plugins: [react(), tailwindcss()],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+      'process.env.QWEN_API_KEY': JSON.stringify(env.QWEN_API_KEY),
+      'process.env.DASHSCOPE_API_KEY': JSON.stringify(env.DASHSCOPE_API_KEY),
+      'process.env.LLM_API_KEY': JSON.stringify(env.LLM_API_KEY),
+      'process.env.QWEN_BASE_URL': JSON.stringify(env.QWEN_BASE_URL),
+      'process.env.LLM_BASE_URL': JSON.stringify(env.LLM_BASE_URL),
+      'process.env.LLM_MODEL': JSON.stringify(env.LLM_MODEL),
     },
     resolve: {
       alias: {

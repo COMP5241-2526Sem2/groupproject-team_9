@@ -1,12 +1,80 @@
-import { GoogleGenAI, Type } from "@google/genai";
 import { SimulationData } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+type QwenChatResponse = {
+  choices?: Array<{ message?: { content?: unknown } }>;
+  output?: { choices?: Array<{ message?: { content?: unknown } }>; text?: string };
+};
+
+function getQwenConfig() {
+  const apiKey =
+    process.env.QWEN_API_KEY ||
+    process.env.DASHSCOPE_API_KEY ||
+    process.env.LLM_API_KEY ||
+    "";
+
+  if (!apiKey) {
+    throw new Error("Missing QWEN_API_KEY (or DASHSCOPE_API_KEY / LLM_API_KEY).");
+  }
+
+  const baseUrl =
+    process.env.QWEN_BASE_URL ||
+    process.env.LLM_BASE_URL ||
+    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+
+  return {
+    apiKey,
+    baseUrl: baseUrl.replace(/\/$/, ""),
+    model: process.env.LLM_MODEL || "qwen-plus",
+  };
+}
+
+function extractQwenText(data: QwenChatResponse): string {
+  const content =
+    data?.choices?.[0]?.message?.content ??
+    data?.output?.choices?.[0]?.message?.content;
+
+  if (typeof content === "string") return content.trim();
+
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (typeof part?.text === "string") return part.text;
+        return "";
+      })
+      .join("\n")
+      .trim();
+
+    if (text) return text;
+  }
+
+  if (typeof data?.output?.text === "string") {
+    return data.output.text.trim();
+  }
+
+  return "";
+}
 
 export async function generateSimulation(topic: string): Promise<SimulationData> {
-  const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
-    contents: `Generate a step-by-step graphical simulation for the Computer Science topic: "${topic}".
+  const { apiKey, baseUrl, model } = getQwenConfig();
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.3,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a precise teaching assistant. Return only valid JSON that matches the requested schema. Do not wrap JSON in markdown.",
+        },
+        {
+          role: "user",
+          content: `Generate a step-by-step graphical simulation for the Computer Science topic: "${topic}".
     The output must be a structured JSON representing nodes, edges, and teaching steps.
     
     CRITICAL PEDAGOGICAL STRUCTURE FOR MACHINE LEARNING & NLP (NN, CNN, RNN, LSTM, Transformer):
@@ -78,71 +146,43 @@ export async function generateSimulation(topic: string): Promise<SimulationData>
     
     Ensure labels are concise to avoid overlap.
     Make it educational and detailed.`,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          topic: { type: Type.STRING },
-          layout: { type: Type.STRING, enum: ['layered', 'sequential', 'tree', 'force', 'networking', 'cnn', 'rnn', 'lstm', 'transformer'] },
-          nodes: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                id: { type: Type.STRING },
-                label: { type: Type.STRING },
-                type: { type: Type.STRING, enum: ['input', 'process', 'output', 'layer', 'neuron', 'sender', 'receiver', 'conv_filter', 'pooling', 'feature_map', 'recurrent_neuron', 'gate', 'cell_state', 'data', 'client', 'server', 'router', 'database', 'state', 'token', 'embedding', 'attention_head', 'encoder', 'decoder', 'dataset', 'loss_function', 'optimizer', 'switch', 'firewall', 'actor', 'key', 'certificate'] },
-                description: { type: Type.STRING }
-              },
-              required: ['id', 'label', 'type']
-            }
-          },
-          edges: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                source: { type: Type.STRING },
-                target: { type: Type.STRING },
-                label: { type: Type.STRING },
-                animated: { type: Type.BOOLEAN },
-                variant: { type: Type.STRING, enum: ['forward', 'backward'] }
-              },
-              required: ['source', 'target']
-            }
-          },
-          steps: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                explanation: { type: Type.STRING },
-                highlightNodes: { type: Type.ARRAY, items: { type: Type.STRING } },
-                highlightEdges: { type: Type.ARRAY, items: { type: Type.STRING } },
-                activeData: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      nodeId: { type: Type.STRING },
-                      value: { type: Type.STRING }
-                    }
-                  }
-                }
-              },
-              required: ['title', 'explanation', 'highlightNodes', 'highlightEdges']
-            }
-          }
         },
-        required: ['topic', 'layout', 'nodes', 'edges', 'steps']
-      }
-    }
+      ],
+      response_format: { type: "json_object" },
+    }),
   });
 
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Qwen request failed (${response.status}): ${detail}`);
+  }
+
+  const data = (await response.json()) as QwenChatResponse;
+  const text = extractQwenText(data);
+  if (!text) {
+    throw new Error("Empty response from Qwen.");
+  }
+
   try {
-    return JSON.parse(response.text || "{}") as SimulationData;
+    const parsed = JSON.parse(text) as SimulationData;
+
+    if (!parsed || !Array.isArray(parsed.steps)) {
+      throw new Error("Missing steps in simulation response");
+    }
+
+    const normalizedSteps = parsed.steps.map((step) => ({
+      ...step,
+      highlightNodes: Array.isArray(step.highlightNodes) ? step.highlightNodes : [],
+      highlightEdges: Array.isArray(step.highlightEdges) ? step.highlightEdges : [],
+      activeData: Array.isArray(step.activeData) ? step.activeData : [],
+    }));
+
+    return {
+      ...parsed,
+      nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
+      edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+      steps: normalizedSteps,
+    } as SimulationData;
   } catch (e) {
     console.error("Failed to parse AI response", e);
     throw new Error("Invalid simulation data generated");

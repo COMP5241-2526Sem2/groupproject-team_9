@@ -113,6 +113,7 @@ const renderLegend = (simulation: SimulationData) => {
 export default function VisionApp({ onClose }: { onClose?: () => void }) {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [simulation, setSimulation] = useState<SimulationData | null>(null);
   const [currentStep, setCurrentStep] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -143,13 +144,16 @@ export default function VisionApp({ onClose }: { onClose?: () => void }) {
     if (!searchTopic.trim()) return;
 
     setLoading(true);
+    setError(null);
     setQuery(searchTopic); // Sync query state if it was an override
     try {
       const data = await generateSimulation(searchTopic);
       setSimulation(data);
       setCurrentStep(0);
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Failed to generate simulation. Please try again.';
       console.error(error);
+      setError(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -248,6 +252,21 @@ export default function VisionApp({ onClose }: { onClose?: () => void }) {
         <section className="lg:col-span-6 space-y-6">
           <div className="aspect-[4/3] bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden flex flex-col">
             {!simulation && !loading && (
+              error ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-center p-12 space-y-4">
+                  <div className="w-20 h-20 bg-red-50 rounded-full flex items-center justify-center text-red-600 mb-2">
+                    <span className="text-3xl font-bold">!</span>
+                  </div>
+                  <h2 className="text-2xl font-bold text-red-600">Error</h2>
+                  <p className="text-gray-600 max-w-sm">{error}</p>
+                  <button
+                    onClick={() => setError(null)}
+                    className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-full text-sm font-medium hover:bg-blue-700 transition-colors"
+                  >
+                    Try Again
+                  </button>
+                </div>
+              ) : (
               <div className="flex-1 flex flex-col items-center justify-center text-center p-12 space-y-4">
                 <div className="w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center text-blue-600 mb-2">
                   <Play size={32} fill="currentColor" />
@@ -257,6 +276,7 @@ export default function VisionApp({ onClose }: { onClose?: () => void }) {
                   Enter any computer science concept in the search bar above, and the AI will build an interactive learning simulation for you.
                 </p>
               </div>
+              )
             )}
 
             {loading && (
