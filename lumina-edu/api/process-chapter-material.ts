@@ -1117,11 +1117,47 @@ function parseQuizJson(raw: string): any[] {
     .replace(/\s*```$/i, '')
     .trim();
 
+  const extractQuizArray = (value: any): any[] | null => {
+    if (Array.isArray(value)) return value;
+    if (Array.isArray(value?.quiz)) return value.quiz;
+    if (Array.isArray(value?.quiz?.questions)) return value.quiz.questions;
+    if (Array.isArray(value?.questions)) return value.questions;
+    if (Array.isArray(value?.data?.questions)) return value.data.questions;
+    if (Array.isArray(value?.items)) return value.items;
+
+    if (typeof value?.quiz === 'string') {
+      try {
+        const parsed = JSON.parse(value.quiz);
+        return extractQuizArray(parsed);
+      } catch {}
+    }
+
+    if (typeof value?.questions === 'string') {
+      try {
+        const parsed = JSON.parse(value.questions);
+        return extractQuizArray(parsed);
+      } catch {}
+    }
+
+    return null;
+  };
+
   try {
     const parsed = JSON.parse(cleaned);
-    if (Array.isArray(parsed)) return parsed;
-    if (Array.isArray(parsed?.quiz)) return parsed.quiz;
+    const extracted = extractQuizArray(parsed);
+    if (extracted) return extracted;
   } catch {}
+
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const sliced = cleaned.slice(firstBrace, lastBrace + 1);
+    try {
+      const parsed = JSON.parse(sliced);
+      const extracted = extractQuizArray(parsed);
+      if (extracted) return extracted;
+    } catch {}
+  }
 
   const firstBracket = cleaned.indexOf('[');
   const lastBracket = cleaned.lastIndexOf(']');

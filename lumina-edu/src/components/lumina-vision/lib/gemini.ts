@@ -177,10 +177,24 @@ export async function generateSimulation(topic: string): Promise<SimulationData>
       activeData: Array.isArray(step.activeData) ? step.activeData : [],
     }));
 
+    const normalizedNodes = Array.isArray(parsed.nodes) ? parsed.nodes : [];
+    const nodeIds = new Set(
+      normalizedNodes
+        .map((node) => (typeof node?.id === "string" ? node.id : ""))
+        .filter(Boolean)
+    );
+    const normalizedEdges = Array.isArray(parsed.edges)
+      ? parsed.edges.filter((edge) => {
+          const source = typeof edge?.source === "string" ? edge.source : "";
+          const target = typeof edge?.target === "string" ? edge.target : "";
+          return source && target && nodeIds.has(source) && nodeIds.has(target);
+        })
+      : [];
+
     return {
       ...parsed,
-      nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
-      edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+      nodes: normalizedNodes,
+      edges: normalizedEdges,
       steps: normalizedSteps,
     } as SimulationData;
   } catch (e) {
