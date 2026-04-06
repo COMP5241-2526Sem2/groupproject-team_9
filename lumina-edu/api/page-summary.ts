@@ -562,9 +562,9 @@ function createSseResponse(
           return;
         }
 
-        const prompt = `You are an educational assistant. Based on the following content extracted from page ${payload.pageNumber} of the lecture slides, provide a clear and concise summary suitable for students. Highlight the key concepts, important definitions, and main takeaways. Content: ${truncate(
+        const prompt = `Summarize the following lecture slide content in 3-5 bullet points. Focus on key concepts and definitions only:\n\nContent: ${truncate(
           text,
-          12000
+          8000
         )}`;
 
         const preferredProvider = getDefaultAiProvider();
