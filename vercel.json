@@ -1,9 +1,9 @@
 {
-  "buildCommand": "cd lumina-edu && npm install && npm run build",
+  "buildCommand": "npm install && npm run build",
   "installCommand": "npm install",
-  "outputDirectory": "lumina-edu/dist",
+  "outputDirectory": "dist",
   "functions": {
-    "lumina-edu/api/**/*.ts": {
+    "api/**/*.ts": {
       "runtime": "nodejs20.x"
     }
   }
