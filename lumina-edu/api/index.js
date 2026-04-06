@@ -1,10 +1,9 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 
-import processChapterMaterialHandler from './process-chapter-material';
-import qwenChatDocHandler from './qwen-chat-doc';
-import pageSummaryHandler from './page-summary';
+import processChapterMaterialHandler from './process-chapter-material.js';
+import qwenChatDocHandler from './qwen-chat-doc.js';
+import pageSummaryHandler from './chapters/[chapterId]/page-summary.js';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -14,14 +13,19 @@ const app = express();
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
-// 复制 server.ts 里的辅助函数
-function buildWebRequest(req, PORT = 3000) {
-  const host = req.get('host') || `localhost:${PORT}`;
+function buildWebRequest(req) {
+  const host =
+    req.headers['x-forwarded-host'] ||
+    req.get('host') ||
+    'localhost:3000';
+
   const protocol =
     req.headers['x-forwarded-proto']?.toString().split(',')[0] ||
     req.protocol ||
-    'http';
+    'https';
+
   const url = `${protocol}://${host}${req.originalUrl}`;
+  console.log('[buildWebRequest] url:', url);
 
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
@@ -75,7 +79,7 @@ async function runHandler(req, res, handler) {
   }
 }
 
-// 注册所有路由
+// ✅ 注册所有路由
 app.post('/api/process-chapter-material', (req, res) => {
   runHandler(req, res, processChapterMaterialHandler);
 });
@@ -85,6 +89,8 @@ app.post('/api/qwen-chat-doc', (req, res) => {
 });
 
 app.post('/api/chapters/:chapterId/page-summary', (req, res) => {
+  // ✅ 把 chapterId 注入到 req 让 handler 能读到
+  req.params = req.params || {};
   runHandler(req, res, pageSummaryHandler);
 });
 
