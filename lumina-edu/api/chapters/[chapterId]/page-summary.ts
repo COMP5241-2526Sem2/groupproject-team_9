@@ -482,14 +482,14 @@ function createSseResponse(
       const close = () => {
         if (closed) return;
         closed = true;
-        clearInterval(heartbeat);
+        //clearInterval(heartbeat);
         controller.close();
       };
 
-      const heartbeat = setInterval(() => {
-        if (closed) return;
-        controller.enqueue(encoder.encode(': keepalive\n\n'));
-      }, 15000);
+      //const heartbeat = setInterval(() => {
+      //  if (closed) return;
+      //  controller.enqueue(encoder.encode(': keepalive\n\n'));
+      //}, 15000);
 
       try {
         push('start', {
