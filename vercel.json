@@ -2,8 +2,14 @@
   "buildCommand": "npm install && npm run build",
   "installCommand": "npm install",
   "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/index.js"
+    }
+  ],
   "functions": {
-    "api/**/*.ts": {
+    "api/index.js": {
       "runtime": "nodejs20.x",
       "maxDuration": 300
     }
