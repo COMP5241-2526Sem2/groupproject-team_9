@@ -2,7 +2,6 @@
   "buildCommand": "cd lumina-edu && npm install && npm run build",
   "installCommand": "npm install",
   "outputDirectory": "lumina-edu/dist",
-  "public": "lumina-edu/dist",
   "env": {
     "GEMINI_API_KEY": "@gemini_api_key",
     "QWEN_API_KEY": "@qwen_api_key",
