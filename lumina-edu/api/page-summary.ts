@@ -25,6 +25,8 @@ type SummaryRequestBody = {
 type AiProvider = 'qwen' | 'gemini';
 
 const STORAGE_BUCKET = 'course-materials';
+const SUMMARY_SYSTEM_PROMPT =
+  'You are an educational assistant. Summarize slide content clearly and accurately for students. Highlight key concepts, definitions, and takeaways.';
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -108,7 +110,7 @@ function truncate(text: string, maxLen = 12000) {
 async function fetchWithTimeout(
   input: RequestInfo | URL,
   init: RequestInit = {},
-  timeoutMs = 120000
+  timeoutMs = 180000
 ) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -179,75 +181,6 @@ async function extractPptxSlideText(
   return { text, totalPages, outOfRange: false };
 }
 
-async function callGeminiText(prompt: string) {
-  const { apiKey, baseUrl, model } = getGeminiConfig();
-
-  const endpoint = `${baseUrl}/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  const response = await fetchWithTimeout(
-    endpoint,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                text: prompt,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.3,
-        },
-      }),
-    },
-    120000
-  );
-
-  const raw = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`Gemini request failed: ${response.status} ${truncate(raw, 1200)}`);
-  }
-
-  let data: any;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    throw new Error(`Gemini returned invalid JSON: ${truncate(raw, 1200)}`);
-  }
-
-  const blockedReason =
-    data?.promptFeedback?.blockReason || data?.prompt_feedback?.block_reason;
-
-  if (blockedReason) {
-    throw new Error(`Gemini blocked the request: ${String(blockedReason)}`);
-  }
-
-  const parts = data?.candidates?.[0]?.content?.parts;
-  if (Array.isArray(parts)) {
-    const text = parts
-      .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
-      .join('\n')
-      .trim();
-
-    if (text) return text;
-  }
-
-  if (typeof data?.text === 'string' && data.text.trim()) {
-    return data.text.trim();
-  }
-
-  throw new Error(`Gemini returned empty content: ${truncate(raw, 1200)}`);
-}
-
 function extractQwenText(data: any): string {
   const content =
     data?.choices?.[0]?.message?.content ??
@@ -277,7 +210,116 @@ function extractQwenText(data: any): string {
   return '';
 }
 
-async function callQwenText(prompt: string) {
+function extractQwenDeltaText(data: any): string {
+  const delta = data?.choices?.[0]?.delta?.content;
+
+  if (typeof delta === 'string') {
+    return delta;
+  }
+
+  if (Array.isArray(delta)) {
+    return delta
+      .map((part: any) => {
+        if (typeof part === 'string') return part;
+        if (typeof part?.text === 'string') return part.text;
+        return '';
+      })
+      .join('');
+  }
+
+  return '';
+}
+
+function extractGeminiText(data: any): string {
+  const blockedReason =
+    data?.promptFeedback?.blockReason || data?.prompt_feedback?.block_reason;
+
+  if (blockedReason) {
+    throw new Error(`Gemini blocked the request: ${String(blockedReason)}`);
+  }
+
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(parts)) {
+    const text = parts
+      .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
+      .join('\n')
+      .trim();
+
+    if (text) return text;
+  }
+
+  if (typeof data?.text === 'string' && data.text.trim()) {
+    return data.text.trim();
+  }
+
+  return '';
+}
+
+function parseSseFrame(frame: string) {
+  let event = 'message';
+  const dataLines: string[] = [];
+
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || 'message';
+      continue;
+    }
+
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+
+  return {
+    event,
+    data: dataLines.join('\n'),
+  };
+}
+
+async function readSseResponse(
+  response: Response,
+  onJsonData: (data: any) => void
+) {
+  if (!response.body) {
+    throw new Error('Provider did not return a readable stream.');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    while (true) {
+      const separator = buffer.indexOf('\n\n');
+      if (separator === -1) break;
+
+      const frame = buffer.slice(0, separator).trim();
+      buffer = buffer.slice(separator + 2);
+
+      if (!frame || frame.startsWith(':')) continue;
+
+      const { data } = parseSseFrame(frame);
+      if (!data || data === '[DONE]') continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        onJsonData(parsed);
+      } catch {
+        // Ignore provider keepalive and malformed chunks.
+      }
+    }
+  }
+}
+
+async function callQwenTextStream(
+  prompt: string,
+  onDelta: (chunk: string) => void
+) {
   const { apiKey, baseUrl, model } = getQwenConfig();
   const endpoint = `${baseUrl}/chat/completions`;
 
@@ -292,11 +334,11 @@ async function callQwenText(prompt: string) {
       body: JSON.stringify({
         model,
         temperature: 0.3,
+        stream: true,
         messages: [
           {
             role: 'system',
-            content:
-              'You are an educational assistant. Summarize slide content clearly and accurately for students. Highlight key concepts, definitions, and takeaways.',
+            content: SUMMARY_SYSTEM_PROMPT,
           },
           {
             role: 'user',
@@ -305,26 +347,89 @@ async function callQwenText(prompt: string) {
         ],
       }),
     },
-    120000
+    180000
   );
 
-  const raw = await response.text();
-
   if (!response.ok) {
+    const raw = await response.text();
     throw new Error(`Qwen request failed: ${response.status} ${truncate(raw, 1200)}`);
   }
 
-  let data: any;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    throw new Error(`Qwen returned invalid JSON: ${truncate(raw, 1200)}`);
+  let fallbackText = '';
+
+  await readSseResponse(response, (payload) => {
+    const delta = extractQwenDeltaText(payload);
+    if (delta) {
+      onDelta(delta);
+      return;
+    }
+
+    // Some providers may still return full text shape in stream payloads.
+    fallbackText = fallbackText || extractQwenText(payload);
+  });
+
+  if (fallbackText) {
+    onDelta(fallbackText);
+  }
+}
+
+async function callGeminiTextStream(
+  prompt: string,
+  onDelta: (chunk: string) => void
+) {
+  const { apiKey, baseUrl, model } = getGeminiConfig();
+
+  const endpoint = `${baseUrl}/models/${encodeURIComponent(
+    model
+  )}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text: prompt,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.3,
+        },
+      }),
+    },
+    180000
+  );
+
+  if (!response.ok) {
+    const raw = await response.text();
+    throw new Error(`Gemini request failed: ${response.status} ${truncate(raw, 1200)}`);
   }
 
-  const text = extractQwenText(data);
-  if (text) return text;
+  let aggregated = '';
 
-  throw new Error(`Qwen returned empty content: ${truncate(raw, 1200)}`);
+  await readSseResponse(response, (payload) => {
+    const text = extractGeminiText(payload);
+    if (!text) return;
+
+    // Gemini stream payload may be cumulative; only emit the suffix delta.
+    if (text.startsWith(aggregated)) {
+      const delta = text.slice(aggregated.length);
+      if (delta) onDelta(delta);
+      aggregated = text;
+      return;
+    }
+
+    aggregated += text;
+    onDelta(text);
+  });
 }
 
 async function getChapter(
@@ -355,6 +460,188 @@ function isPptxFile(chapter: ChapterRow) {
   );
 }
 
+function createSseResponse(
+  payload: { chapterId: string; pageNumber: number }
+) {
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let closed = false;
+
+      const push = (event: string, data: unknown) => {
+        if (closed) return;
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+        );
+      };
+
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(heartbeat);
+        controller.close();
+      };
+
+      const heartbeat = setInterval(() => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(': keepalive\n\n'));
+      }, 15000);
+
+      try {
+        push('start', {
+          ok: true,
+          message: 'Summary generation started.',
+        });
+
+        const supabase = getSupabaseAdmin();
+        const chapter = await getChapter(supabase, payload.chapterId);
+
+        if (!chapter) {
+          push('error', { ok: false, error: 'Chapter not found.' });
+          close();
+          return;
+        }
+
+        const storagePath = chapter.ppt?.storagePath;
+        if (!storagePath) {
+          push('error', {
+            ok: false,
+            error: 'No uploaded slide deck found for this chapter.',
+          });
+          close();
+          return;
+        }
+
+        if (!isPptxFile(chapter)) {
+          push('error', {
+            ok: false,
+            error: 'Only PPTX files are supported for page summaries at the moment.',
+          });
+          close();
+          return;
+        }
+
+        const { data, error } = await supabase.storage
+          .from(STORAGE_BUCKET)
+          .download(storagePath);
+
+        if (error || !data) {
+          console.error('[page-summary] storage download error:', error);
+          push('error', {
+            ok: false,
+            error: 'Failed to download the slide deck from storage.',
+          });
+          close();
+          return;
+        }
+
+        const buffer = await data.arrayBuffer();
+        const { text, totalPages, outOfRange } = await extractPptxSlideText(
+          buffer,
+          payload.pageNumber
+        );
+
+        if (outOfRange) {
+          push('error', {
+            ok: false,
+            error: 'Page number out of range.',
+            totalPages,
+          });
+          close();
+          return;
+        }
+
+        if (!text || text.length < 10) {
+          push('error', {
+            ok: false,
+            error: 'No readable text was found on this slide.',
+            totalPages,
+          });
+          close();
+          return;
+        }
+
+        const prompt = `You are an educational assistant. Based on the following content extracted from page ${payload.pageNumber} of the lecture slides, provide a clear and concise summary suitable for students. Highlight the key concepts, important definitions, and main takeaways. Content: ${truncate(
+          text,
+          12000
+        )}`;
+
+        const preferredProvider = getDefaultAiProvider();
+        let provider: AiProvider = preferredProvider;
+        let summary = '';
+
+        const emitDelta = (chunk: string) => {
+          if (!chunk) return;
+          summary += chunk;
+          push('delta', { text: chunk });
+        };
+
+        push('meta', {
+          ok: true,
+          provider,
+          pageNumber: payload.pageNumber,
+          totalPages,
+        });
+
+        if (preferredProvider === 'gemini') {
+          await callGeminiTextStream(prompt, emitDelta);
+        } else {
+          try {
+            await callQwenTextStream(prompt, emitDelta);
+          } catch (qwenError) {
+            if (!hasGeminiApiKey()) throw qwenError;
+
+            console.warn('[page-summary] Qwen failed, fallback to Gemini:', qwenError);
+            provider = 'gemini';
+            push('meta', {
+              ok: true,
+              provider,
+              fallbackFrom: 'qwen',
+            });
+            await callGeminiTextStream(prompt, emitDelta);
+          }
+        }
+
+        if (!summary.trim()) {
+          push('error', {
+            ok: false,
+            error: 'Model returned empty content.',
+          });
+          close();
+          return;
+        }
+
+        push('done', {
+          ok: true,
+          summary,
+          provider,
+          pageNumber: payload.pageNumber,
+          totalPages,
+        });
+        close();
+      } catch (err) {
+        console.error('[page-summary] stream error:', err);
+        push('error', {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Unknown server error',
+        });
+        close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+}
+
 export default async function handler(req: Request) {
   if (req.method !== 'POST') {
     return json({ ok: false, error: 'Method not allowed' }, 405);
@@ -377,97 +664,9 @@ export default async function handler(req: Request) {
       return json({ ok: false, error: 'Invalid page number.' }, 400);
     }
 
-    const supabase = getSupabaseAdmin();
-    const chapter = await getChapter(supabase, chapterId);
-
-    if (!chapter) {
-      return json({ ok: false, error: 'Chapter not found.' }, 404);
-    }
-
-    const storagePath = chapter.ppt?.storagePath;
-    if (!storagePath) {
-      return json({ ok: false, error: 'No uploaded slide deck found for this chapter.' }, 409);
-    }
-
-    if (!isPptxFile(chapter)) {
-      return json(
-        {
-          ok: false,
-          error: 'Only PPTX files are supported for page summaries at the moment.',
-        },
-        415
-      );
-    }
-
-    const { data, error } = await supabase.storage
-      .from(STORAGE_BUCKET)
-      .download(storagePath);
-
-    if (error || !data) {
-      console.error('[page-summary] storage download error:', error);
-      return json(
-        {
-          ok: false,
-          error: 'Failed to download the slide deck from storage.',
-        },
-        500
-      );
-    }
-
-    const buffer = await data.arrayBuffer();
-    const { text, totalPages, outOfRange } = await extractPptxSlideText(
-      buffer,
-      Math.floor(pageNumber)
-    );
-
-    if (outOfRange) {
-      return json(
-        {
-          ok: false,
-          error: 'Page number out of range.',
-          totalPages,
-        },
-        400
-      );
-    }
-
-    if (!text || text.length < 10) {
-      return json(
-        {
-          ok: false,
-          error: 'No readable text was found on this slide.',
-          totalPages,
-        },
-        422
-      );
-    }
-
-    const prompt = `You are an educational assistant. Based on the following content extracted from page ${pageNumber} of the lecture slides, provide a clear and concise summary suitable for students. Highlight the key concepts, important definitions, and main takeaways. Content: ${truncate(
-      text,
-      12000
-    )}`;
-
-    const provider = getDefaultAiProvider();
-    let summary = '';
-
-    if (provider === 'gemini') {
-      summary = await callGeminiText(prompt);
-    } else {
-      try {
-        summary = await callQwenText(prompt);
-      } catch (qwenError) {
-        if (!hasGeminiApiKey()) throw qwenError;
-        console.warn('[page-summary] Qwen failed, fallback to Gemini:', qwenError);
-        summary = await callGeminiText(prompt);
-      }
-    }
-
-    return json({
-      ok: true,
-      summary,
-      provider,
+    return createSseResponse({
+      chapterId,
       pageNumber: Math.floor(pageNumber),
-      totalPages,
     });
   } catch (err) {
     console.error('[page-summary] handler error:', err);

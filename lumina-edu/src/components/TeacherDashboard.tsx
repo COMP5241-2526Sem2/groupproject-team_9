@@ -68,6 +68,27 @@ interface TeacherDashboardProps {
   user: { id: string; role: 'teacher' | 'student'; name: string };
 }
 
+function parseSseFrame(frame: string) {
+  let event = 'message';
+  const dataLines: string[] = [];
+
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || 'message';
+      continue;
+    }
+
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+
+  return {
+    event,
+    data: dataLines.join('\n'),
+  };
+}
+
 const PROCESSING_STAGE_LABELS: Record<string, string> = {
   queued: 'Queued',
   extracting_text: 'Extracting text',
@@ -207,6 +228,7 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
   const [isPageSummaryLoading, setIsPageSummaryLoading] = useState(false);
 
   const mountedRef = useRef(true);
+  const pageSummaryAbortRef = useRef<AbortController | null>(null);
   const processingTriggerRef = useRef<Record<string, boolean>>({});
   const processingMonitorRef = useRef<Record<string, boolean>>({});
 
@@ -376,6 +398,7 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
     void fetchChapters();
 
     return () => {
+      pageSummaryAbortRef.current?.abort();
       mountedRef.current = false;
     };
   }, [fetchChapters]);
@@ -698,11 +721,12 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
     }
 
     setIsPageSummaryLoading(true);
-    setPageSummary(null);
+    setPageSummary('');
     setPageSummaryError(null);
 
+    pageSummaryAbortRef.current?.abort();
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    pageSummaryAbortRef.current = controller;
 
     try {
       const response = await fetch(
@@ -715,29 +739,112 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
         }
       );
 
-      const text = await response.text();
-      let result: any = null;
+      const contentType = response.headers.get('content-type') || '';
 
-      try {
-        result = JSON.parse(text);
-      } catch {
-        throw new Error(`The API returned invalid JSON: ${text.slice(0, 200)}`);
-      }
+      if (!response.ok) {
+        const text = await response.text();
+        let result: any = null;
 
-      if (!response.ok || !result?.ok) {
+        try {
+          result = JSON.parse(text);
+        } catch {
+          throw new Error(text || 'Failed to generate summary.');
+        }
+
         throw new Error(result?.error || 'Failed to generate summary.');
       }
 
-      setPageSummary(result.summary || 'No summary was generated.');
+      if (contentType.includes('application/json')) {
+        const text = await response.text();
+        let result: any = null;
+
+        try {
+          result = JSON.parse(text);
+        } catch {
+          throw new Error(`The API returned invalid JSON: ${text.slice(0, 200)}`);
+        }
+
+        if (!result?.ok) {
+          throw new Error(result?.error || 'Failed to generate summary.');
+        }
+
+        if (!mountedRef.current) return;
+        setPageSummary(result.summary || 'No summary was generated.');
+        return;
+      }
+
+      if (!response.body) {
+        throw new Error('Summary stream is not readable.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let sawDelta = false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        while (true) {
+          const separator = buffer.indexOf('\n\n');
+          if (separator === -1) break;
+
+          const frame = buffer.slice(0, separator).trim();
+          buffer = buffer.slice(separator + 2);
+
+          if (!frame || frame.startsWith(':')) continue;
+
+          const { event, data } = parseSseFrame(frame);
+          if (!data) continue;
+
+          let payload: any = null;
+          try {
+            payload = JSON.parse(data);
+          } catch {
+            continue;
+          }
+
+          if (event === 'delta') {
+            const chunk = String(payload?.text || '');
+            if (!chunk) continue;
+
+            sawDelta = true;
+            if (!mountedRef.current) continue;
+
+            setPageSummary((prev) => `${prev || ''}${chunk}`);
+            continue;
+          }
+
+          if (event === 'error') {
+            throw new Error(payload?.error || 'Failed to generate summary.');
+          }
+
+          if (event === 'done' && !sawDelta && mountedRef.current) {
+            setPageSummary(String(payload?.summary || 'No summary was generated.'));
+          }
+        }
+      }
+
+      if (!mountedRef.current) return;
+
+      setPageSummary((prev) => {
+        if (prev && prev.trim()) return prev;
+        return 'No summary was generated.';
+      });
     } catch (error: any) {
       console.error('Page summary error:', error);
       const errorMessage =
         error?.name === 'AbortError'
-          ? 'The request timed out. Please try again.'
+          ? 'The summary request was cancelled.'
           : error?.message || 'An error occurred while generating the summary.';
       setPageSummaryError(errorMessage);
     } finally {
-      clearTimeout(timeoutId);
+      if (pageSummaryAbortRef.current === controller) {
+        pageSummaryAbortRef.current = null;
+      }
       if (mountedRef.current) {
         setIsPageSummaryLoading(false);
       }
@@ -1629,7 +1736,7 @@ export default function TeacherDashboard({ course }: TeacherDashboardProps) {
                         </div>
                       )}
 
-                      {pageSummary && !pageSummaryError && (
+                      {pageSummary !== null && !pageSummaryError && (
                         <div className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800/30 rounded-lg p-4">
                           <div className="prose prose-sm max-w-none dark:prose-invert prose-indigo">
                             <Markdown>{pageSummary}</Markdown>

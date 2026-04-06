@@ -33,6 +33,27 @@ interface StudentTutorProps {
   user: { id: string; role: 'teacher' | 'student'; name: string };
 }
 
+function parseSseFrame(frame: string) {
+  let event = 'message';
+  const dataLines: string[] = [];
+
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || 'message';
+      continue;
+    }
+
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+
+  return {
+    event,
+    data: dataLines.join('\n'),
+  };
+}
+
 type ChapterStatus = 'idle' | 'queued' | 'processing' | 'ready' | 'failed';
 
 const PROCESSING_STAGE_LABELS: Record<string, string> = {
@@ -467,13 +488,12 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
     }
 
     setIsPageSummaryLoading(true);
-    setPageSummary(null);
+    setPageSummary('');
     setPageSummaryError(null);
 
     pageSummaryAbortRef.current?.abort();
     const controller = new AbortController();
     pageSummaryAbortRef.current = controller;
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
 
     try {
       const response = await fetch(
@@ -486,22 +506,101 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
         }
       );
 
-      const text = await response.text();
-      let result: any = null;
+      const contentType = response.headers.get('content-type') || '';
 
-      try {
-        result = JSON.parse(text);
-      } catch {
-        throw new Error(`API did not return valid JSON: ${text.slice(0, 200)}`);
+      if (!response.ok) {
+        const text = await response.text();
+        let result: any = null;
+
+        try {
+          result = JSON.parse(text);
+        } catch {
+          throw new Error(text || 'Failed to generate summary.');
+        }
+
+        throw new Error(result?.error || 'Failed to generate summary.');
       }
 
-      if (!response.ok || !result?.ok) {
-        throw new Error(result?.error || 'Failed to generate summary.');
+      if (contentType.includes('application/json')) {
+        const text = await response.text();
+        let result: any = null;
+
+        try {
+          result = JSON.parse(text);
+        } catch {
+          throw new Error(`API did not return valid JSON: ${text.slice(0, 200)}`);
+        }
+
+        if (!result?.ok) {
+          throw new Error(result?.error || 'Failed to generate summary.');
+        }
+
+        if (!mountedRef.current) return;
+        setPageSummary(result.summary || 'No summary was generated.');
+        return;
+      }
+
+      if (!response.body) {
+        throw new Error('Summary stream is not readable.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let sawDelta = false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        while (true) {
+          const separator = buffer.indexOf('\n\n');
+          if (separator === -1) break;
+
+          const frame = buffer.slice(0, separator).trim();
+          buffer = buffer.slice(separator + 2);
+
+          if (!frame || frame.startsWith(':')) continue;
+
+          const { event, data } = parseSseFrame(frame);
+          if (!data) continue;
+
+          let payload: any = null;
+          try {
+            payload = JSON.parse(data);
+          } catch {
+            continue;
+          }
+
+          if (event === 'delta') {
+            const chunk = String(payload?.text || '');
+            if (!chunk) continue;
+
+            sawDelta = true;
+            if (!mountedRef.current) continue;
+
+            setPageSummary((prev) => `${prev || ''}${chunk}`);
+            continue;
+          }
+
+          if (event === 'error') {
+            throw new Error(payload?.error || 'Failed to generate summary.');
+          }
+
+          if (event === 'done' && !sawDelta && mountedRef.current) {
+            setPageSummary(String(payload?.summary || 'No summary was generated.'));
+          }
+        }
       }
 
       if (!mountedRef.current) return;
 
-      setPageSummary(result.summary || 'No summary was generated.');
+      setPageSummary((prev) => {
+        if (prev && prev.trim()) return prev;
+        return 'No summary was generated.';
+      });
     } catch (error: any) {
       console.error('Page summary error:', error);
 
@@ -509,11 +608,10 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
 
       const errorMessage =
         error?.name === 'AbortError'
-          ? 'The request took too long and was cancelled. Please try again.'
+          ? 'The summary request was cancelled.'
           : error?.message || 'Sorry, I encountered an error while generating the summary.';
       setPageSummaryError(errorMessage);
     } finally {
-      clearTimeout(timeoutId);
       if (pageSummaryAbortRef.current === controller) {
         pageSummaryAbortRef.current = null;
       }
@@ -983,7 +1081,7 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
             )}
           </div>
 
-          {pageSummary && !pageSummaryError && (
+          {pageSummary !== null && !pageSummaryError && (
             <div className="flex-1 overflow-y-auto bg-emerald-50 dark:bg-emerald-900/20 border-b border-emerald-100 dark:border-emerald-800/30 p-4">
               <div className="prose prose-sm max-w-none dark:prose-invert prose-emerald">
                 <Markdown>{pageSummary}</Markdown>
