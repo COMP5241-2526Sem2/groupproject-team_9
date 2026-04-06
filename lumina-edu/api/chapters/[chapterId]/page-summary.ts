@@ -651,16 +651,55 @@ export default async function handler(req: Request) {
   }
 
   try {
-    const url = new URL(req.url);
-    const pathParts = url.pathname.split('/').filter(Boolean);
-    const chaptersIndex = pathParts.indexOf('chapters');
-    const chapterId = chaptersIndex >= 0 ? pathParts[chaptersIndex + 1] : '';
+    //const url = new URL(req.url);
+    //const pathParts = url.pathname.split('/').filter(Boolean);
+    //const chaptersIndex = pathParts.indexOf('chapters');
+    //const chapterId = chaptersIndex >= 0 ? pathParts[chaptersIndex + 1] : '';
+
+    // ✅ 新写法：兼容所有情况
+    let chapterId = '';
+
+    // 方式1: Express req.params（经过 index.js 路由）
+    if ((req as any).params?.chapterId) {
+      chapterId = String((req as any).params.chapterId).trim();
+    }
+
+    // 方式2: URL query string (?chapterId=xxx)
+    if (!chapterId) {
+      try {
+        const rawUrl = (req as any).originalUrl || req.url || '';
+        const fullUrl = rawUrl.startsWith('http')
+          ? rawUrl
+          : `https://placeholder.com${rawUrl}`;
+        const url = new URL(fullUrl);
+        chapterId =
+          url.searchParams.get('chapterId') ||
+          (() => {
+            const parts = url.pathname.split('/').filter(Boolean);
+            const idx = parts.indexOf('chapters');
+            return idx >= 0 ? parts[idx + 1] : '';
+          })();
+      } catch {
+        chapterId = '';
+      }
+    }
 
     if (!chapterId) {
       return json({ ok: false, error: 'Missing chapterId' }, 400);
     }
 
-    const body = (await req.json().catch(() => null)) as SummaryRequestBody | null;
+    //const body = (await req.json().catch(() => null)) as SummaryRequestBody | null;
+    let body: SummaryRequestBody | null = null;
+    try {
+      if (typeof (req as any).json === 'function') {
+        body = await req.json();
+      } else {
+        body = (req as any).body ?? null;
+      }
+    } catch {
+      body = null;
+    }
+    
     const pageNumber = Number(body?.pageNumber);
 
     if (!Number.isFinite(pageNumber) || pageNumber < 1) {

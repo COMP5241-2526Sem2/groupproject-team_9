@@ -252,7 +252,17 @@ export default async function handler(req: Request) {
 
   try {
     const supabase = getSupabaseAdmin();
-    const body = await req.json().catch(() => null);
+    //const body = await req.json().catch(() => null);
+    let body: any = null;
+    try {
+      if (typeof (req as any).json === 'function') {
+        body = await req.json();
+      } else {
+        body = (req as any).body ?? null;
+      }
+    } catch {
+      body = null;
+    }
 
     const chapterId = String(body?.chapterId || '').trim();
     const question = String(body?.question || '').trim();

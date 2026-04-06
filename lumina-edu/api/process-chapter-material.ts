@@ -260,7 +260,17 @@ export default async function handler(req: Request) {
 
   try {
     const supabase = getSupabaseAdmin();
-    const body = (await req.json()) as ProcessPayload;
+    //const body = (await req.json()) as ProcessPayload;
+    let body: ProcessPayload;
+try {
+  if (typeof (req as any).json === 'function') {
+    body = await req.json() as ProcessPayload;
+  } else {
+    body = (req as any).body as ProcessPayload;
+  }
+} catch {
+  return json({ ok: false, error: 'Invalid request body' }, 400);
+}
 
     if (!body.chapterId || !body.fileUrl) {
       return json({ ok: false, error: 'Missing chapterId or fileUrl.' }, 400);
