@@ -110,7 +110,7 @@ function truncate(text: string, maxLen = 12000) {
 async function fetchWithTimeout(
   input: RequestInfo | URL,
   init: RequestInit = {},
-  timeoutMs = 180000
+  timeoutMs = 110000
 ) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -347,7 +347,7 @@ async function callQwenTextStream(
         ],
       }),
     },
-    180000
+    105000
   );
 
   if (!response.ok) {
@@ -405,7 +405,7 @@ async function callGeminiTextStream(
         },
       }),
     },
-    180000
+    105000
   );
 
   if (!response.ok) {
