@@ -1,9 +1,9 @@
 import express from 'express';
 import dotenv from 'dotenv';
 
-import processChapterMaterialHandler from './process-chapter-material.js';
-import qwenChatDocHandler from './qwen-chat-doc.js';
-import pageSummaryHandler from './chapters/[chapterId]/page-summary.js';
+import processChapterMaterialHandler from '../api/process-chapter-material.js';
+import qwenChatDocHandler from '../api/qwen-chat-doc.js';
+import pageSummaryHandler from '../api/chapters/[chapterId]/page-summary.js';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();

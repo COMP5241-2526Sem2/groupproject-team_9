@@ -1,3 +1,3 @@
-export function GET() {
-  return Response.json({ ok: true, message: 'pong' });
+export async function GET() {
+  return Response.json({ ok: true, from: "vercel" });
 }

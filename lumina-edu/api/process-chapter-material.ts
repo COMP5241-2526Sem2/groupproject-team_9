@@ -15,6 +15,12 @@ function json(data: unknown, status = 200) {
   });
 }
 
+type PageSummaryCacheItem = {
+  summary: string;
+  provider: string;
+  updatedAt: string;
+};
+
 type ChapterPptMeta = {
   supabaseUrl?: string;
   originalName?: string;
@@ -22,6 +28,13 @@ type ChapterPptMeta = {
   relevant_reading?: string | null;
   is_reading_published?: boolean;
   last_processed_at?: string | null;
+
+  // 新增：给轻量 summary 用
+  pageTextMap?: Record<string, string> | null;
+  pageSummaryCache?: Record<string, PageSummaryCacheItem> | null;
+  pageCount?: number | null;
+  pageIndexReady?: boolean | null;
+  pageIndexError?: string | null;
 };
 
 type ChapterRow = {
@@ -260,17 +273,17 @@ export default async function handler(req: Request) {
 
   try {
     const supabase = getSupabaseAdmin();
-    //const body = (await req.json()) as ProcessPayload;
+
     let body: ProcessPayload;
-try {
-  if (typeof (req as any).json === 'function') {
-    body = await req.json() as ProcessPayload;
-  } else {
-    body = (req as any).body as ProcessPayload;
-  }
-} catch {
-  return json({ ok: false, error: 'Invalid request body' }, 400);
-}
+    try {
+      if (typeof (req as any).json === 'function') {
+        body = (await req.json()) as ProcessPayload;
+      } else {
+        body = (req as any).body as ProcessPayload;
+      }
+    } catch {
+      return json({ ok: false, error: 'Invalid request body' }, 400);
+    }
 
     if (!body.chapterId || !body.fileUrl) {
       return json({ ok: false, error: 'Missing chapterId or fileUrl.' }, 400);
@@ -364,7 +377,11 @@ async function processChapterMaterial(
   const resolvedMimeType = normalizeMimeType(fileName, mimeType);
   const storagePath = chapter.ppt?.storagePath || null;
 
+  const resetPpt = resetDerivedPptMeta(chapter.ppt);
+
   await updateChapterProgress(supabase, chapterId, {
+    ppt: resetPpt,
+    extracted_text: null,
     content_status: 'processing',
     processing_stage: 'extracting_text',
     processing_progress: 15,
@@ -464,8 +481,26 @@ async function processChapterMaterial(
     overallContextText = stripPageLabelsFromExtractedText(pageNumberedText);
   }
 
+  const pages = extractPagesFromText(pageNumberedText);
+  if (!pages.length) {
+    throw new Error('No page sections could be extracted from the processed document.');
+  }
+
+  const pageTextMap = buildPageTextMap(pages);
+  const pageCount = pages.length;
+
+  const indexedPpt: ChapterPptMeta = {
+    ...resetPpt,
+    pageTextMap,
+    pageSummaryCache: {},
+    pageCount,
+    pageIndexReady: true,
+    pageIndexError: null,
+  };
+
   await updateChapterProgress(supabase, chapterId, {
     extracted_text: pageNumberedText,
+    ppt: indexedPpt,
     content_status: 'processing',
     processing_stage: 'chunking',
     processing_progress: 45,
@@ -474,8 +509,6 @@ async function processChapterMaterial(
 
   const chunks = chunkText(overallContextText, 1800, 200);
   const condensedContext = buildCondensedContext(chunks);
-
-  const pages = extractPagesFromText(pageNumberedText);
   const pageAwareContext = buildPageAwareContext(pages);
 
   await updateChapterProgress(supabase, chapterId, {
@@ -515,7 +548,7 @@ async function processChapterMaterial(
   }
 
   const nextPpt: ChapterPptMeta = {
-    ...(chapter.ppt || {}),
+    ...indexedPpt,
     relevant_reading: reading,
     is_reading_published: false,
     last_processed_at: new Date().toISOString(),
@@ -578,6 +611,21 @@ async function failChapter(
   errorMessage: string
 ) {
   try {
+    const chapter = await getChapter(supabase, chapterId);
+
+    const hasPageIndex =
+      !!chapter?.ppt?.pageTextMap &&
+      Object.keys(chapter.ppt.pageTextMap || {}).length > 0;
+
+    const nextPpt = chapter?.ppt
+      ? {
+          ...chapter.ppt,
+          pageIndexReady: hasPageIndex,
+          pageIndexError: hasPageIndex ? null : errorMessage,
+          pageSummaryCache: chapter.ppt.pageSummaryCache || {},
+        }
+      : undefined;
+
     await supabase
       .from('chapters')
       .update({
@@ -585,11 +633,37 @@ async function failChapter(
         processing_stage: 'failed',
         processing_progress: 0,
         processing_error: errorMessage,
+        ...(nextPpt ? { ppt: nextPpt } : {}),
       })
       .eq('id', chapterId);
   } catch (err) {
     console.error('[failChapter] error:', err);
   }
+}
+
+function resetDerivedPptMeta(ppt: ChapterPptMeta | null | undefined): ChapterPptMeta {
+  return {
+    ...(ppt || {}),
+    relevant_reading: null,
+    is_reading_published: false,
+    last_processed_at: null,
+    pageTextMap: null,
+    pageSummaryCache: {},
+    pageCount: null,
+    pageIndexReady: false,
+    pageIndexError: null,
+  };
+}
+
+function buildPageTextMap(pages: PageSection[]): Record<string, string> {
+  const out: Record<string, string> = {};
+
+  for (const page of pages) {
+    out[String(page.page)] =
+      page.content?.trim() || NO_READABLE_TEXT_PLACEHOLDER;
+  }
+
+  return out;
 }
 
 async function extractPdfWithGeminiPageMarkers(args: {
@@ -818,19 +892,19 @@ async function extractPptxPageNumberedTextFromStorage(
     })
     .sort((a, b) => a.index - b.index);
 
-  const pageBlocks: string[] = [];
+  const pageBlocks = await Promise.all(
+    slides.map(async (slide, idx) => {
+      const slideFile = zip.file(slide.name);
+      if (!slideFile) {
+        return `[Page ${idx + 1}]\n${NO_READABLE_TEXT_PLACEHOLDER}`;
+      }
 
-  for (let i = 0; i < slides.length; i += 1) {
-    const slideFile = zip.file(slides[i].name);
-    if (!slideFile) continue;
+      const xml = await slideFile.async('string');
+      const text = extractTextFromSlideXml(xml).trim();
 
-    const xml = await slideFile.async('string');
-    const text = extractTextFromSlideXml(xml).trim();
-
-    pageBlocks.push(
-      `[Page ${i + 1}]\n${text || NO_READABLE_TEXT_PLACEHOLDER}`
-    );
-  }
+      return `[Page ${idx + 1}]\n${text || NO_READABLE_TEXT_PLACEHOLDER}`;
+    })
+  );
 
   if (pageBlocks.length === 0) {
     throw new Error('No readable text was found in the PPTX slides.');

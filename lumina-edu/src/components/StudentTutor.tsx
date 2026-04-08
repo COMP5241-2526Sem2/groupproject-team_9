@@ -33,28 +33,10 @@ interface StudentTutorProps {
   user: { id: string; role: 'teacher' | 'student'; name: string };
 }
 
-function parseSseFrame(frame: string) {
-  let event = 'message';
-  const dataLines: string[] = [];
-
-  for (const line of frame.split('\n')) {
-    if (line.startsWith('event:')) {
-      event = line.slice(6).trim() || 'message';
-      continue;
-    }
-
-    if (line.startsWith('data:')) {
-      dataLines.push(line.slice(5).trim());
-    }
-  }
-
-  return {
-    event,
-    data: dataLines.join('\n'),
-  };
-}
-
 type ChapterStatus = 'idle' | 'queued' | 'processing' | 'ready' | 'failed';
+
+const CHAT_TIMEOUT_MS = 120000;
+const PAGE_SUMMARY_TIMEOUT_MS = 120000;
 
 const PROCESSING_STAGE_LABELS: Record<string, string> = {
   queued: 'Queued',
@@ -122,6 +104,65 @@ function getProgress(chapter?: Chapter | null) {
   return 0;
 }
 
+function isPdfChapter(chapter?: Chapter | null) {
+  if (!chapter) return false;
+
+  return (
+    chapter.mime_type === 'application/pdf' ||
+    chapter.ppt?.originalName?.toLowerCase().endsWith('.pdf') === true
+  );
+}
+
+function isPptxChapter(chapter?: Chapter | null) {
+  if (!chapter) return false;
+
+  return (
+    chapter.mime_type ===
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+    chapter.ppt?.originalName?.toLowerCase().endsWith('.pptx') === true
+  );
+}
+
+function createTimedAbortController(timeoutMs: number) {
+  const controller = new AbortController();
+  let didTimeout = false;
+
+  const timeoutId = setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, timeoutMs);
+
+  return {
+    controller,
+    clear: () => clearTimeout(timeoutId),
+    didTimeout: () => didTimeout,
+  };
+}
+
+async function readResponseText(response: Response) {
+  try {
+    return await response.text();
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw error;
+    }
+    return '';
+  }
+}
+
+async function readJsonSafely(text: string) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function truncateText(text: string, maxLen = 240) {
+  if (!text) return '';
+  return text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
+}
+
 export default function StudentTutor({ course, user }: StudentTutorProps) {
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [activeChapterId, setActiveChapterId] = useState<string | null>(null);
@@ -148,8 +189,11 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   const [isDraggingRight, setIsDraggingRight] = useState(false);
 
   const mountedRef = useRef(true);
+  const activeChapterIdRef = useRef<string | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
   const pageSummaryAbortRef = useRef<AbortController | null>(null);
+  const chatRequestIdRef = useRef(0);
+  const pageSummaryRequestIdRef = useRef(0);
 
   const activeChapter = useMemo(
     () => chapters.find((c) => c.id === activeChapterId) || null,
@@ -161,10 +205,13 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   const activeChapterStageLabel = getStageLabel(activeChapter);
 
   const tutorAvailable = activeChapterStatus === 'ready';
+  const pageSummarySupported = isPptxChapter(activeChapter);
+
   const readingAvailable =
     activeChapterStatus === 'ready' &&
     !!activeChapter?.ppt?.relevant_reading &&
     !!activeChapter?.ppt?.is_reading_published;
+
   const quizAvailable =
     activeChapterStatus === 'ready' &&
     !!activeChapter?.quiz &&
@@ -232,6 +279,10 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   }, []);
 
   useEffect(() => {
+    activeChapterIdRef.current = activeChapterId;
+  }, [activeChapterId]);
+
+  useEffect(() => {
     mountedRef.current = true;
     void fetchChapters();
 
@@ -239,6 +290,8 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       mountedRef.current = false;
       chatAbortRef.current?.abort();
       pageSummaryAbortRef.current?.abort();
+      chatRequestIdRef.current += 1;
+      pageSummaryRequestIdRef.current += 1;
     };
   }, [fetchChapters]);
 
@@ -333,6 +386,9 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
   }, [messages, scrollToBottom]);
 
   useEffect(() => {
+    chatRequestIdRef.current += 1;
+    pageSummaryRequestIdRef.current += 1;
+
     setMessages([]);
     setPageSummary(null);
     setPageSummaryError(null);
@@ -360,6 +416,8 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
     if (!input.trim() || isLoading || !activeChapter) return;
 
     const userMessage = input.trim();
+    const chapterIdAtRequestStart = activeChapter.id;
+    const requestId = ++chatRequestIdRef.current;
     const nextHistory: Message[] = [...messages, { role: 'user', content: userMessage }];
 
     setInput('');
@@ -395,14 +453,15 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
     setIsLoading(true);
 
     chatAbortRef.current?.abort();
-    const controller = new AbortController();
+    const abortCtx = createTimedAbortController(CHAT_TIMEOUT_MS);
+    const controller = abortCtx.controller;
     chatAbortRef.current = controller;
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
 
     try {
       const response = await fetch('/api/qwen-chat-doc', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({
           chapterId: activeChapter.id,
           question: userMessage,
@@ -411,13 +470,11 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
         signal: controller.signal,
       });
 
-      const text = await response.text();
+      const text = await readResponseText(response);
+      const result = await readJsonSafely(text);
 
-      let result: any = null;
-      try {
-        result = JSON.parse(text);
-      } catch {
-        throw new Error(`API did not return valid JSON: ${text.slice(0, 200)}`);
+      if (!result) {
+        throw new Error(`API did not return valid JSON: ${truncateText(text, 200)}`);
       }
 
       if (!response.ok || !result?.ok) {
@@ -425,6 +482,8 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       }
 
       if (!mountedRef.current) return;
+      if (chatRequestIdRef.current !== requestId) return;
+      if (activeChapterIdRef.current !== chapterIdAtRequestStart) return;
 
       setMessages((prev) => [
         ...prev,
@@ -437,11 +496,20 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       console.error('Chat error:', error);
 
       if (!mountedRef.current) return;
+      if (chatRequestIdRef.current !== requestId) return;
+
+      if (error?.name === 'AbortError' && !abortCtx.didTimeout()) {
+        return;
+      }
 
       const errorMessage =
         error?.name === 'AbortError'
-          ? 'The request took too long and was cancelled. Please try again.'
+          ? 'The request took too long. Please try again, or ask a shorter and more specific question.'
           : error?.message || 'Sorry, I encountered an error while processing your request.';
+
+      if (activeChapterIdRef.current !== chapterIdAtRequestStart) {
+        return;
+      }
 
       setMessages((prev) => [
         ...prev,
@@ -451,11 +519,11 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
         },
       ]);
     } finally {
-      clearTimeout(timeoutId);
+      abortCtx.clear();
       if (chatAbortRef.current === controller) {
         chatAbortRef.current = null;
       }
-      if (mountedRef.current) {
+      if (mountedRef.current && chatRequestIdRef.current === requestId) {
         setIsLoading(false);
       }
     }
@@ -487,12 +555,27 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       return;
     }
 
+    if (!pageSummarySupported) {
+      setPageSummary(null);
+      setPageSummaryError(
+        isPdfChapter(activeChapter)
+          ? 'Page Summary currently supports PPTX slides only. PDF files are not supported yet.'
+          : 'Page Summary is currently available only for PPTX slides.'
+      );
+      return;
+    }
+
+    const normalizedPageNumber = Math.floor(pageNumber);
+    const chapterIdAtRequestStart = activeChapter.id;
+    const requestId = ++pageSummaryRequestIdRef.current;
+
     setIsPageSummaryLoading(true);
     setPageSummary('');
     setPageSummaryError(null);
 
     pageSummaryAbortRef.current?.abort();
-    const controller = new AbortController();
+    const abortCtx = createTimedAbortController(PAGE_SUMMARY_TIMEOUT_MS);
+    const controller = abortCtx.controller;
     pageSummaryAbortRef.current = controller;
 
     try {
@@ -501,121 +584,61 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pageNumber: Math.floor(pageNumber) }),
+          cache: 'no-store',
+          body: JSON.stringify({ pageNumber: normalizedPageNumber }),
           signal: controller.signal,
         }
       );
 
-      const contentType = response.headers.get('content-type') || '';
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      const text = await readResponseText(response);
+      const result = await readJsonSafely(text);
 
-      if (!response.ok) {
-        const text = await response.text();
-        let result: any = null;
+      if (!result) {
+        throw new Error(
+          `Page Summary API returned an unexpected ${contentType || 'unknown'} response: ${truncateText(
+            text || `HTTP ${response.status}`,
+            240
+          )}`
+        );
+      }
 
-        try {
-          result = JSON.parse(text);
-        } catch {
-          throw new Error(text || 'Failed to generate summary.');
-        }
-
+      if (!response.ok || !result?.ok) {
         throw new Error(result?.error || 'Failed to generate summary.');
       }
 
-      if (contentType.includes('application/json')) {
-        const text = await response.text();
-        let result: any = null;
-
-        try {
-          result = JSON.parse(text);
-        } catch {
-          throw new Error(`API did not return valid JSON: ${text.slice(0, 200)}`);
-        }
-
-        if (!result?.ok) {
-          throw new Error(result?.error || 'Failed to generate summary.');
-        }
-
-        if (!mountedRef.current) return;
-        setPageSummary(result.summary || 'No summary was generated.');
-        return;
-      }
-
-      if (!response.body) {
-        throw new Error('Summary stream is not readable.');
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let sawDelta = false;
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        while (true) {
-          const separator = buffer.indexOf('\n\n');
-          if (separator === -1) break;
-
-          const frame = buffer.slice(0, separator).trim();
-          buffer = buffer.slice(separator + 2);
-
-          if (!frame || frame.startsWith(':')) continue;
-
-          const { event, data } = parseSseFrame(frame);
-          if (!data) continue;
-
-          let payload: any = null;
-          try {
-            payload = JSON.parse(data);
-          } catch {
-            continue;
-          }
-
-          if (event === 'delta') {
-            const chunk = String(payload?.text || '');
-            if (!chunk) continue;
-
-            sawDelta = true;
-            if (!mountedRef.current) continue;
-
-            setPageSummary((prev) => `${prev || ''}${chunk}`);
-            continue;
-          }
-
-          if (event === 'error') {
-            throw new Error(payload?.error || 'Failed to generate summary.');
-          }
-
-          if (event === 'done' && !sawDelta && mountedRef.current) {
-            setPageSummary(String(payload?.summary || 'No summary was generated.'));
-          }
-        }
-      }
-
       if (!mountedRef.current) return;
+      if (pageSummaryRequestIdRef.current !== requestId) return;
+      if (activeChapterIdRef.current !== chapterIdAtRequestStart) return;
 
-      setPageSummary((prev) => {
-        if (prev && prev.trim()) return prev;
-        return 'No summary was generated.';
-      });
+      setPageSummary(result.summary || 'No summary was generated.');
     } catch (error: any) {
       console.error('Page summary error:', error);
 
       if (!mountedRef.current) return;
+      if (pageSummaryRequestIdRef.current !== requestId) return;
+
+      if (error?.name === 'AbortError' && !abortCtx.didTimeout()) {
+        return;
+      }
+
+      if (activeChapterIdRef.current !== chapterIdAtRequestStart) {
+        return;
+      }
 
       const errorMessage =
         error?.name === 'AbortError'
-          ? 'The summary request was cancelled.'
+          ? 'The summary request took too long. Please try again in a moment.'
           : error?.message || 'Sorry, I encountered an error while generating the summary.';
+
+      setPageSummary(null);
       setPageSummaryError(errorMessage);
     } finally {
+      abortCtx.clear();
       if (pageSummaryAbortRef.current === controller) {
         pageSummaryAbortRef.current = null;
       }
-      if (mountedRef.current) {
+      if (mountedRef.current && pageSummaryRequestIdRef.current === requestId) {
         setIsPageSummaryLoading(false);
       }
     }
@@ -631,9 +654,7 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
       );
     }
 
-    const isPdf =
-      activeChapter.mime_type === 'application/pdf' ||
-      activeChapter.ppt?.originalName?.toLowerCase().endsWith('.pdf');
+    const isPdf = isPdfChapter(activeChapter);
 
     if (isPdf) {
       const googleDocsUrl = `https://docs.google.com/viewer?url=${encodeURIComponent(
@@ -1054,18 +1075,24 @@ export default function StudentTutor({ course, user }: StudentTutorProps) {
                 value={pageNumberInput}
                 onChange={(e) => setPageNumberInput(e.target.value)}
                 className="w-24 px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                disabled={isPageSummaryLoading || !tutorAvailable}
+                disabled={isPageSummaryLoading || !tutorAvailable || !pageSummarySupported}
                 aria-label="Page number"
               />
               <button
                 type="button"
                 onClick={handleGeneratePageSummary}
-                disabled={isPageSummaryLoading || !tutorAvailable}
+                disabled={isPageSummaryLoading || !tutorAvailable || !pageSummarySupported}
                 className="px-3 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {isPageSummaryLoading ? 'Generating...' : 'Generate Summary'}
               </button>
             </div>
+
+            {!pageSummarySupported && tutorAvailable && (
+              <div className="mt-3 text-sm text-amber-600 dark:text-amber-400">
+                Page Summary currently supports PPTX slides only.
+              </div>
+            )}
 
             {isPageSummaryLoading && (
               <div className="mt-3 flex items-center gap-2 text-sm text-emerald-600 dark:text-emerald-400">
