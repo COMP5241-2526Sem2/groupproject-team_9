@@ -1,18 +1,16 @@
 {
-  "buildCommand": "npm install && npm run build",
-  "installCommand": "npm install",
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
   "outputDirectory": "dist",
-  "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/api/index.js"
-    }
-  ],
   "functions": {
-    "api/index.js": {
-      
+    "api/chapters/**/*.ts": {
+      "maxDuration": 300
+    },
+    "api/qwen-chat-doc.ts": {
+      "maxDuration": 300
+    },
+    "api/process-chapter-material.ts": {
       "maxDuration": 300
     }
   }
 }
-
