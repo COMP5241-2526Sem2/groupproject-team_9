@@ -3,13 +3,13 @@
   "framework": "vite",
   "outputDirectory": "dist",
   "functions": {
-    "lumina-edu/api/chapters/**/*.ts": {
+    "api/chapters/**/*.ts": {
       "maxDuration": 300
     },
-    "lumina-edu/api/qwen-chat-doc.ts": {
+    "api/qwen-chat-doc.ts": {
       "maxDuration": 300
     },
-    "lumina-edu/api/process-chapter-material.ts": {
+    "api/process-chapter-material.ts": {
       "maxDuration": 300
     }
   }
