@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "outputDirectory": "dist",
+  "functions": {
+    "lumina-edu/api/chapters/**/*.ts": {
+      "maxDuration": 300
+    },
+    "lumina-edu/api/qwen-chat-doc.ts": {
+      "maxDuration": 300
+    },
+    "lumina-edu/api/process-chapter-material.ts": {
+      "maxDuration": 300
+    }
+  }
+}
